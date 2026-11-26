@@ -594,7 +594,7 @@ void Flyout::Reposition() {
     UpdateRegion(false);
 }
 
-// The refresh icon turns once a second while probing and, when the probe
+// The refresh icon turns while probing and, when the probe
 // ends, finishes its turn back to rest instead of snapping there.
 float Flyout::SpinAngle() {
     double now = NowMs();
@@ -603,7 +603,7 @@ float Flyout::SpinAngle() {
         spinStart_ = now;
     }
     if (!spinning_) return 0;
-    double turned = (now - spinStart_) * 0.36;
+    double turned = (now - spinStart_) * 0.54;  // degrees per ms: a turn every 0.67 s
     if (usage_->probing) {
         spinEnd_ = -1;
     } else {
