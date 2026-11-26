@@ -157,6 +157,9 @@ private:
     void QueueFrame();
     void AnimFrame();
     void StartBars(bool instant);
+    float SpinAngle();         // refresh icon: degrees, and whether it's still turning
+    bool spinning_ = false;
+    double spinStart_ = 0, spinEnd_ = -1;  // NowMs() it started; total degrees to stop at
 
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;

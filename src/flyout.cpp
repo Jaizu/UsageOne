@@ -594,6 +594,29 @@ void Flyout::Reposition() {
     UpdateRegion(false);
 }
 
+// The refresh icon turns once a second while probing and, when the probe
+// ends, finishes its turn back to rest instead of snapping there.
+float Flyout::SpinAngle() {
+    double now = NowMs();
+    if (usage_->probing && !spinning_) {
+        spinning_ = true;
+        spinStart_ = now;
+    }
+    if (!spinning_) return 0;
+    double turned = (now - spinStart_) * 0.36;
+    if (usage_->probing) {
+        spinEnd_ = -1;
+    } else {
+        if (spinEnd_ < 0) spinEnd_ = std::max(360.0, std::ceil(turned / 360.0) * 360.0);
+        if (turned >= spinEnd_) {
+            spinning_ = false;
+            spinEnd_ = -1;
+            return 0;
+        }
+    }
+    return (float)std::fmod(turned, 360.0);
+}
+
 void Flyout::OnUsageChanged() {
     if (!visible_) return;
     StartBars(false);
@@ -825,10 +848,10 @@ float Flyout::LayoutMain(float y, bool draw) {
     // Header: title, plan, refresh button (spins while probing).
     y += 16;
     Hit refresh{HitKind::Refresh, {x1 - 32, y - 4, x1 + 4, y + 32}};
-    Button(refresh, draw);
+    float deg = SpinAngle();
+    if (!spinning_) Button(refresh, draw);  // not pressable until the icon is back at rest
     if (draw) {
         Text(S().title, fTitle_.Get(), {x0, y, x1 - 40, y + 24}, pal_.text);
-        float deg = usage_->probing ? (float)std::fmod(NowMs() * 0.36, 360.0) : 0.0f;
         Glyph(kGlyphRefresh, 16, refresh.rect, pal_.text, deg);
     }
     y += 24;
@@ -1144,7 +1167,7 @@ Flyout::Hit Flyout::HitTest(float x, float y) const {
 void Flyout::Activate(const Hit& h) {
     switch (h.kind) {
         case HitKind::Refresh:
-            if (onRefresh) onRefresh();
+            if (onRefresh && !usage_->probing && !spinning_) onRefresh();
             break;
         case HitKind::Gear:
             GoToView(View::Settings);
@@ -1256,7 +1279,7 @@ void Flyout::SwitchView(View v) {
 
 bool Flyout::Animating() const {
     if (pending_ || gear_.Running() || arrow_.Running() || transition_.Running()) return true;
-    if (usage_->probing && view_ == View::Main) return true;
+    if ((usage_->probing || spinning_) && view_ == View::Main) return true;
     for (const Anim& a : bars_)
         if (a.Running()) return true;
     return false;
@@ -1396,7 +1419,7 @@ LRESULT Flyout::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
                     GoToView(View::Main);
                 else
                     Hide();
-            } else if (wp == VK_F5 && onRefresh) {
+            } else if (wp == VK_F5 && onRefresh && !usage_->probing && !spinning_) {
                 onRefresh();
             }
             return 0;
