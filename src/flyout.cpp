@@ -928,11 +928,20 @@ float Flyout::LayoutSettings(float y, bool draw) {
     if (draw) Text(S().settings, fTitle_.Get(), {x0 + 8, y, x1, y + 24}, pal_.text);
     y += 24 + 16;
 
-    struct Row { HitKind kind; const wchar_t* label; bool on; };
+    // The per-model weekly toggle is named after the rows it hides, as the
+    // panel shows them ("Show Weekly · Fable").
+    std::wstring modelWeeks;
+    for (const Limit& l : usage_->data.limits) {
+        if (!Usage::IsModelWeek(l)) continue;
+        modelWeeks += (modelWeeks.empty() ? L"" : L", ") + (modelWeeks.empty() ? LimitName(l.key) : l.key);
+    }
+    modelWeeks = modelWeeks.empty() ? std::wstring(S().showModelWeeks) : Format(S().showRow, modelWeeks);
+
+    struct Row { HitKind kind; std::wstring label; bool on; };
     const Row rows[] = {
         {HitKind::ToggleStartup, S().startWithWindows, startup_},
         {HitKind::TogglePeak, S().showPeak, settings_->showPeak},
-        {HitKind::ToggleModelWeeks, S().showModelWeeks, settings_->showModelWeeks},
+        {HitKind::ToggleModelWeeks, modelWeeks, settings_->showModelWeeks},
         {HitKind::ToggleStar, S().starIcon, settings_->starIcon},
     };
     const float rh = 52;

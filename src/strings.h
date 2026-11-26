@@ -33,6 +33,7 @@ struct Strings {
     const wchar_t* showPeak;
     const wchar_t* starIcon;
     const wchar_t* showModelWeeks;
+    const wchar_t* showRow;        // %s = a row's name: "Show Weekly · Fable"
     const wchar_t* barColor;
     const wchar_t* barColorDesc;
     const wchar_t* barAccent;
