@@ -37,6 +37,9 @@ UpdateState g_update;
 Updater::ReleaseInfo g_release;
 bool g_updateManual = false;  // the user clicked "Check": also report "Up to date"
 PluginState g_plugin;
+#ifdef USAGEONE_DEV
+bool g_autoInstallUpdate = false;  // /install-update: install a found update without the button (updater test)
+#endif
 
 // --- Dark context menu (undocumented uxtheme exports) ------------------------
 
@@ -192,6 +195,8 @@ void CheckForUpdates(bool manual) {
     if (h) CloseHandle(h);
 }
 
+void InstallUpdate();
+
 void OnUpdateChecked(Updater::ReleaseInfo* info) {
     LOG(L"update: check %s%s", info ? L"ok, latest " : L"failed", info ? info->version.c_str() : L"");
     if (info && Updater::IsNewer(info->version, APP_VERSION)) {
@@ -199,6 +204,9 @@ void OnUpdateChecked(Updater::ReleaseInfo* info) {
         g_update.version = info->version;
         g_update.notes = info->notes;
         SetUpdateStatus(UpdateState::Available);
+#ifdef USAGEONE_DEV
+        if (g_autoInstallUpdate) InstallUpdate();
+#endif
     } else if (g_updateManual || g_update.status == UpdateState::Checking) {
         SetUpdateStatus(info ? UpdateState::UpToDate : UpdateState::Failed);
     }
@@ -435,6 +443,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
     // Development aid: /theme light|dark draws the panel in that theme (tools\screenshots.ps1).
     if (wcsstr(cmdLine, L"/theme light")) Flyout::themeOverride = 1;
     if (wcsstr(cmdLine, L"/theme dark")) Flyout::themeOverride = 2;
+    g_autoInstallUpdate = wcsstr(cmdLine, L"/install-update") != nullptr;
 #endif
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

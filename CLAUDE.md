@@ -62,4 +62,5 @@ Keep the code readable and split by responsibility (one file per piece, see the 
 - `tools\measure.ps1`: the README's performance numbers (start, panel open, memory, CPU; development builds, `/toggle`).
 - `tools\install-plugin.ps1`: installs the plugin from `obj\` without going through Settings.
 - `tools\use-release.ps1`: replaces the local build with the latest release.
+- Updater test: build an older version (e.g. 0.9.9 in `src\version.h`, not committed) with `build.cmd dev <folder>`, close the running UsageOne and start that copy with `/background /install-update`: it finds the latest release, installs it and restarts as that version. Then start `bin\UsageOne.exe` again (it re-points the startup entry to itself).
 - Launch tools through WMI (`Win32_Process.Create`), as these scripts do, when running from the Claude desktop app: its child processes get a virtualized registry and AppData, and can't see other apps' windows.
