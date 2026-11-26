@@ -33,4 +33,10 @@ enum : UINT {
     WM_APP_TRAY = WM_APP + 1,  // tray icon callback
     WM_APP_SHOW_FLYOUT,        // second instance asked us to open
     WM_APP_PROBE_DONE,         // usage probe finished (lParam = UsageData*)
+    WM_APP_REFRESH,            // the Stream Deck key asked for fresh numbers
 };
+
+// The Stream Deck plugin asks the running app for its numbers through this
+// pipe: it writes "status" or "refresh" and a newline, and gets one line of
+// JSON back (see PipeStatus in main.cpp).
+#define STATUS_PIPE_NAME L"\\\\.\\pipe\\UsageOne"

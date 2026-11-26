@@ -36,5 +36,11 @@ cl %CFLAGS% src\main.cpp src\flyout.cpp src\usage.cpp src\settings.cpp src\strin
    user32.lib gdi32.lib shell32.lib ole32.lib advapi32.lib dwmapi.lib d2d1.lib dwrite.lib shcore.lib ^
    d3d11.lib coremessaging.lib windowsapp.lib || exit /b 1
 
+rem The Stream Deck plugin (see streamdeck\ and tools\install-plugin.ps1).
+cl %CFLAGS% src\plugin.cpp src\settings.cpp src\trayicon.cpp obj\app.res ^
+   /Fe:"%OUT%\UsageOne.StreamDeck.exe" /link %LFLAGS% /SUBSYSTEM:WINDOWS ^
+   user32.lib gdi32.lib shell32.lib ole32.lib advapi32.lib d2d1.lib dwrite.lib windowscodecs.lib ^
+   winhttp.lib crypt32.lib shlwapi.lib || exit /b 1
+
 echo.
 echo Built %OUT%\UsageOne.exe

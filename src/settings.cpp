@@ -16,12 +16,18 @@ static void WriteDword(const wchar_t* name, DWORD v) {
 void Settings::Load() {
     showPeak = ReadDword(L"ShowPeak", 1) != 0;
     starIcon = ReadDword(L"StarIcon", 0) != 0;
+    showModelWeeks = ReadDword(L"ShowModelWeeks", 1) != 0;
+    barColor = std::min<DWORD>(ReadDword(L"BarColor", BarAccent), BarCustom);
+    barCustomColor = ReadDword(L"BarCustomColor", 0xD97757) & 0xFFFFFF;
     refreshMinutes = (int)std::clamp<DWORD>(ReadDword(L"RefreshMinutes", 5), 1, 60);
 }
 
 void Settings::Save() const {
     WriteDword(L"ShowPeak", showPeak);
     WriteDword(L"StarIcon", starIcon);
+    WriteDword(L"ShowModelWeeks", showModelWeeks);
+    WriteDword(L"BarColor", barColor);
+    WriteDword(L"BarCustomColor", barCustomColor);
     WriteDword(L"RefreshMinutes", refreshMinutes);
 }
 

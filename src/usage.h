@@ -44,6 +44,8 @@ constexpr ULONGLONG kHour = 60 * kMinute;
 constexpr ULONGLONG kDay = 24 * kHour;
 
 ULONGLONG NowTicks();
+// A weekly limit of one model ("Current week (Fable)"), not the session or all models.
+inline bool IsModelWeek(const Limit& l) { return l.key != L"session" && l.key != L"all models"; }
 
 // Runs Claude Code and reads the profile; blocking (seconds), call it off the UI thread.
 UsageData Probe();

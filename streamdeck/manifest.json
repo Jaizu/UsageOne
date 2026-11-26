@@ -1,0 +1,38 @@
+{
+  "Name": "UsageOne",
+  "Version": "0.1.0.0",
+  "Author": "Jaizu",
+  "Description": "Claude plan usage (5-hour session and weekly limit) on a key, read by the UsageOne app.",
+  "URL": "https://github.com/Jaizu/UsageOne",
+  "UUID": "com.jaizu.usageone",
+  "Icon": "imgs/plugin",
+  "Category": "UsageOne",
+  "CategoryIcon": "imgs/category",
+  "CodePathWin": "UsageOne.StreamDeck.exe",
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "6.0"
+  },
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Actions": [
+    {
+      "UUID": "com.jaizu.usageone.usage",
+      "Name": "Claude usage",
+      "Tooltip": "Session and weekly usage of your Claude plan. Press to refresh.",
+      "Icon": "imgs/action",
+      "Controllers": ["Keypad"],
+      "SupportedInMultiActions": false,
+      "States": [
+        {
+          "Image": "imgs/key",
+          "ShowTitle": false
+        }
+      ]
+    }
+  ]
+}

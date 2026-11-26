@@ -32,6 +32,13 @@ struct Strings {
     const wchar_t* startWithWindows;
     const wchar_t* showPeak;
     const wchar_t* starIcon;
+    const wchar_t* showModelWeeks;
+    const wchar_t* barColor;
+    const wchar_t* barColorDesc;
+    const wchar_t* barAccent;
+    const wchar_t* barWhite;
+    const wchar_t* barGreen;
+    const wchar_t* barCustom;
     const wchar_t* openWeb;
     const wchar_t* refresh;
     const wchar_t* exit;

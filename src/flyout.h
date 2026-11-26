@@ -74,12 +74,16 @@ public:
 
 private:
     enum class View { Main, Settings };
-    enum class HitKind { None, Refresh, Gear, Back, ToggleStartup, TogglePeak, ToggleStar, OpenWeb };
+    enum class HitKind {
+        None, Refresh, Gear, Back, ToggleStartup, TogglePeak, ToggleStar, ToggleModelWeeks, OpenWeb,
+        BarOption, ColorSwatch, ColorSV, ColorHue,
+    };
     struct Hit {
         HitKind kind = HitKind::None;
         D2D1_RECT_F rect{};
         bool footer = false;  // in the fixed footer
-        bool operator==(const Hit& o) const { return kind == o.kind; }
+        int index = 0;        // which bar colour option
+        bool operator==(const Hit& o) const { return kind == o.kind && index == o.index; }
     };
 
     static LRESULT CALLBACK WndProcThunk(HWND, UINT, WPARAM, LPARAM);
@@ -123,6 +127,22 @@ private:
     void ToggleSwitch(const Hit& h, float x, float cy, bool on, bool draw);
     void Bar(float x0, float x1, float cy, float h, float value, const D2D1_COLOR_F& c);
     D2D1_COLOR_F LevelColor(int percent) const;
+    D2D1_COLOR_F BarColorFor(DWORD option) const;  // Settings::BarColor
+
+    // Bar colour "custom": a hex field (a real EDIT control laid over the
+    // drawn one) and a hue/saturation/value picker, as in VolumeOne.
+    static LRESULT CALLBACK HexEditProc(HWND, UINT, WPARAM, LPARAM);
+    void UpdateHexEdit();
+    void SyncPickerFromColor();
+    void SetPickerValue(const Hit& h, float x, float y);
+    void DrawColorPicker(const D2D1_RECT_F& sv, const D2D1_RECT_F& hue);
+    HWND hexEdit_ = nullptr;
+    HFONT hexFont_ = nullptr;
+    HBRUSH hexBrush_ = nullptr;
+    D2D1_RECT_F hexRect_{-1, -1, -1, -1};
+    bool pickerOpen_ = false;
+    bool pickerSyncing_ = false;  // setting the field's text from the picker
+    float pickerH_ = 0, pickerS_ = 1, pickerV_ = 1;
     void DrawGear(const D2D1_RECT_F& r, const D2D1_COLOR_F& c);
     ID2D1StrokeStyle* RoundStroke();
 

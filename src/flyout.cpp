@@ -539,6 +539,7 @@ void Flyout::Hide() {
         g_hookOwner = nullptr;
     }
     lastHideTick_ = GetTickCount64();
+    if (hexEdit_) ShowWindow(hexEdit_, SW_HIDE);
     ShowWindow(hwnd_, SW_HIDE);
     if (GetCapture() == hwnd_) ReleaseCapture();
 }
@@ -727,7 +728,20 @@ void Flyout::Bar(float x0, float x1, float cy, float h, float value, const D2D1_
 D2D1_COLOR_F Flyout::LevelColor(int percent) const {
     if (percent >= 85) return pal_.danger;
     if (percent >= 60) return pal_.warn;
-    return pal_.accent;
+    return BarColorFor(settings_->barColor);
+}
+
+D2D1_COLOR_F Flyout::BarColorFor(DWORD option) const {
+    switch (option) {
+        case Settings::BarWhite:
+            return pal_.dark ? Rgba(0xFFFFFF) : Rgba(0x3A3A3A);  // "white" is the text colour on light
+        case Settings::BarGreen:
+            return pal_.dark ? Rgba(0x3CC83C) : Rgba(0x0F7B0F);  // the Windows 7 meter green
+        case Settings::BarCustom:
+            return Rgba(settings_->barCustomColor);
+        default:
+            return pal_.accent;
+    }
 }
 
 ID2D1StrokeStyle* Flyout::RoundStroke() {
@@ -844,8 +858,10 @@ float Flyout::LayoutMain(float y, bool draw) {
     }
 
     auto anim = [&](size_t i) { return i < bars_.size() ? bars_[i].Value() : d.limits[i].percent / 100.0f; };
+    auto shown = [&](size_t i) { return settings_->showModelWeeks || !Usage::IsModelWeek(d.limits[i]); };
     bool first = true;
     for (size_t i = 0; i < d.limits.size(); i++) {
+        if (!shown(i)) continue;
         const Limit& l = d.limits[i];
         D2D1_COLOR_F color = LevelColor(l.percent);
         std::wstring num = std::to_wstring(l.percent);
@@ -873,7 +889,9 @@ float Flyout::LayoutMain(float y, bool draw) {
         if (draw) Text(ResetLine(l), fCaption_.Get(), {x0, y, x1, y + 18}, pal_.textSecondary);
         y += 18;
         // A divider after the session; the weeks follow each other.
-        bool sessionDone = l.key == L"session" && i + 1 < d.limits.size();
+        bool more = false;
+        for (size_t j = i + 1; j < d.limits.size(); j++) more = more || shown(j);
+        bool sessionDone = l.key == L"session" && more;
         if (sessionDone) {
             y += 16;
             if (draw) Fill({x0, y, x1, y + 1}, pal_.divider);
@@ -914,6 +932,7 @@ float Flyout::LayoutSettings(float y, bool draw) {
     const Row rows[] = {
         {HitKind::ToggleStartup, S().startWithWindows, startup_},
         {HitKind::TogglePeak, S().showPeak, settings_->showPeak},
+        {HitKind::ToggleModelWeeks, S().showModelWeeks, settings_->showModelWeeks},
         {HitKind::ToggleStar, S().starIcon, settings_->starIcon},
     };
     const float rh = 52;
@@ -930,6 +949,68 @@ float Flyout::LayoutSettings(float y, bool draw) {
         if (draw) Text(rows[i].label, fBody_.Get(), {x0 + 16, ry, x1 - 16 - 40 - 12, ry + rh}, pal_.text);
     }
     y = top + h + 12;
+
+    // Bar colour: four choices; "custom" adds a hex field, and its swatch
+    // opens a picker.
+    {
+        bool custom = settings_->barColor == Settings::BarCustom;
+        bool picker = custom && pickerOpen_;
+        const float kSvH = 110, kHueH = 14;
+        float ch = 12 + 20 + 18 + 8 + 32 + (custom ? 10 + 32 : 0) + (picker ? 10 + kSvH + 10 + kHueH : 0) + 14;
+        float cx0 = x0 + 16, cx1 = x1 - 16;
+        if (draw) {
+            Fill({x0, y, x1, y + ch}, pal_.card, 8);
+            Stroke({x0, y, x1, y + ch}, pal_.cardStroke, 8);
+            Text(S().barColor, fBody_.Get(), {cx0, y + 12, cx1, y + 32}, pal_.text);
+            Text(S().barColorDesc, fCaption_.Get(), {cx0, y + 32, cx1, y + 50}, pal_.textSecondary);
+        }
+        const wchar_t* labels[] = {S().barAccent, S().barWhite, S().barGreen, S().barCustom};
+        float cy = y + 12 + 20 + 18 + 8;
+        float gap = 6, cw = (cx1 - cx0 - gap * 3) / 4;
+        for (int i = 0; i < 4; i++) {
+            float cx = cx0 + i * (cw + gap);
+            Hit chip{HitKind::BarOption, {cx, cy, cx + cw, cy + 32}};
+            chip.index = i;
+            hits_.push_back(chip);
+            if (!draw) continue;
+            bool selected = (int)settings_->barColor == i;
+            Fill(chip.rect, hover_ == chip ? pal_.subtleHover : pal_.toggleOffFill, 4);
+            Stroke(chip.rect, selected ? pal_.accent : pal_.cardStroke, 4, selected ? 2.0f : 1.0f);
+            brush_->SetColor(BarColorFor(i));
+            rt_->FillEllipse(D2D1::Ellipse({cx + 12, cy + 16}, 4.5f, 4.5f), brush_.Get());
+            Text(labels[i], fCaption_.Get(), {cx + 21, cy, cx + cw - 3, cy + 32}, pal_.text);
+        }
+        float py = cy + 32;
+        hexRect_ = {-1, -1, -1, -1};
+        if (custom) {
+            py += 10;
+            hexRect_ = {cx0, py, cx1, py + 32};
+            Hit swatch{HitKind::ColorSwatch, {cx1 - 34, py + 2, cx1 - 2, py + 30}};
+            hits_.push_back(swatch);
+            if (draw) {
+                const D2D1_RECT_F& r = hexRect_;
+                Fill(r, pal_.toggleOffFill, 4);
+                Stroke(r, pal_.cardStroke, 4);
+                Fill({r.left + 4, r.bottom - 2, r.right - 4, r.bottom - 1}, pal_.accent);
+                Text(L"#", fBody_.Get(), {r.left + 10, py, r.left + 24, py + 32}, pal_.textSecondary);
+                if (hover_ == swatch) Fill(swatch.rect, pal_.subtleHover, 4);
+                D2D1_RECT_F sw = {r.right - 26, py + 8, r.right - 10, py + 24};
+                Fill(sw, Rgba(settings_->barCustomColor), 3);
+                Stroke(sw, pickerOpen_ ? pal_.accent : pal_.cardStroke, 3, pickerOpen_ ? 2.0f : 1.0f);
+            }
+            py += 32;
+            if (picker) {
+                py += 10;
+                D2D1_RECT_F sv = {cx0, py, cx1, py + kSvH};
+                D2D1_RECT_F hue = {cx0, py + kSvH + 10, cx1, py + kSvH + 10 + kHueH};
+                hits_.push_back(Hit{HitKind::ColorSV, sv});
+                // A little extra around the hue bar, it is thin.
+                hits_.push_back(Hit{HitKind::ColorHue, {hue.left - 4, hue.top - 4, hue.right + 4, hue.bottom + 4}});
+                if (draw) DrawColorPicker(sv, hue);
+            }
+        }
+        y += ch + 12;
+    }
 
     // Link to the usage page on claude.ai, in the default browser.
     Hit web{HitKind::OpenWeb, {x0, y, x1, y + 48}};
@@ -1070,6 +1151,20 @@ void Flyout::Activate(const Hit& h) {
             settings_->showPeak = !settings_->showPeak;
             settings_->Save();
             break;
+        case HitKind::ToggleModelWeeks:
+            settings_->showModelWeeks = !settings_->showModelWeeks;
+            settings_->Save();
+            if (onTrayIconChanged) onTrayIconChanged();  // the tooltip lists them too
+            break;
+        case HitKind::BarOption:
+            settings_->barColor = (DWORD)h.index;
+            settings_->Save();
+            if (h.index != Settings::BarCustom) pickerOpen_ = false;
+            break;
+        case HitKind::ColorSwatch:
+            pickerOpen_ = !pickerOpen_;
+            if (pickerOpen_) SyncPickerFromColor();
+            break;
         case HitKind::ToggleStar:
             settings_->starIcon = !settings_->starIcon;
             settings_->Save();
@@ -1128,6 +1223,7 @@ void Flyout::AnimFrame() {
     DwmFlush();  // one frame per composition
     if (pending_ && NowMs() >= pendingAt_) SwitchView(pendingView_);
     Render();
+    UpdateHexEdit();
     ValidateRect(hwnd_, nullptr);
     if (Animating())
         QueueFrame();
@@ -1180,10 +1276,36 @@ LRESULT Flyout::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             BeginPaint(hwnd_, &ps);
             Render();
             EndPaint(hwnd_, &ps);
+            UpdateHexEdit();
             return 0;
         }
         case WM_ERASEBKGND:
             return 1;
+
+        case WM_COMMAND:  // custom colour typed in the hex field
+            if (HIWORD(wp) == EN_CHANGE && lp && (HWND)lp == hexEdit_ && !pickerSyncing_) {
+                wchar_t text[16] = {};
+                GetWindowTextW(hexEdit_, text, ARRAYSIZE(text));
+                wchar_t* end = nullptr;
+                unsigned long v = wcstoul(text, &end, 16);
+                if (wcslen(text) == 6 && end && *end == 0) {
+                    settings_->barCustomColor = v;
+                    settings_->Save();
+                    SyncPickerFromColor();
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+            }
+            return 0;
+
+        case WM_CTLCOLOREDIT: {
+            HDC dc = (HDC)wp;
+            COLORREF bg = pal_.dark ? RGB(0x2B, 0x2B, 0x2B) : RGB(0xF9, 0xF9, 0xF9);
+            SetTextColor(dc, pal_.dark ? RGB(255, 255, 255) : RGB(0x1A, 0x1A, 0x1A));
+            SetBkColor(dc, bg);
+            if (hexBrush_) DeleteObject(hexBrush_);
+            hexBrush_ = CreateSolidBrush(bg);
+            return (LRESULT)hexBrush_;
+        }
 
         case WM_ANIM_FRAME:
             AnimFrame();
@@ -1214,6 +1336,10 @@ LRESULT Flyout::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
                 TrackMouseEvent(&tme);
                 tracking_ = true;
             }
+            if (GetCapture() == hwnd_ && (pressed_.kind == HitKind::ColorSV || pressed_.kind == HitKind::ColorHue)) {
+                SetPickerValue(pressed_, x, y);
+                return 0;
+            }
             Hit h = HitTest(x, y);
             if (!(h == hover_)) {
                 hover_ = h;
@@ -1231,6 +1357,10 @@ LRESULT Flyout::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             auto [x, y] = ToPanel(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             SetCapture(hwnd_);
             pressed_ = HitTest(x, y);
+            if (pressed_.kind == HitKind::ColorSV || pressed_.kind == HitKind::ColorHue) {
+                if (hexEdit_ && GetFocus() == hexEdit_) SetFocus(hwnd_);
+                SetPickerValue(pressed_, x, y);
+            }
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
@@ -1240,6 +1370,11 @@ LRESULT Flyout::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             Hit p = pressed_;
             pressed_ = Hit{};
             if (GetCapture() == hwnd_) ReleaseCapture();
+            if (p.kind == HitKind::ColorSV || p.kind == HitKind::ColorHue) {
+                settings_->Save();  // the drag ended
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
             hover_ = h;
             if (p.kind != HitKind::None && h == p) Activate(h);
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1258,4 +1393,180 @@ LRESULT Flyout::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
     }
     return DefWindowProcW(hwnd_, msg, wp, lp);
+}
+
+// ---------------------------------------------------------------------------
+// Bar colour "custom": hex field and picker, from VolumeOne.
+
+// The hex field is a real EDIT control laid over the field the settings view
+// draws. Called after each paint.
+void Flyout::UpdateHexEdit() {
+    bool show = visible_ && view_ == View::Settings && !transition_.Running() && !pending_ && hexRect_.top >= 0 &&
+                hexRect_.bottom <= contentBottom_;
+    if (!show) {
+        if (hexEdit_ && IsWindowVisible(hexEdit_)) ShowWindow(hexEdit_, SW_HIDE);
+        return;
+    }
+    int fontPx = (int)std::lround(14 * scale_);
+    static int lastFontPx = 0;
+    if (!hexFont_ || lastFontPx != fontPx) {
+        if (hexFont_) DeleteObject(hexFont_);
+        hexFont_ = CreateFontW(-fontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                               CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, kTextFont);
+        if (hexEdit_) SendMessageW(hexEdit_, WM_SETFONT, (WPARAM)hexFont_, TRUE);
+        lastFontPx = fontPx;
+    }
+    if (!hexEdit_) {
+        // Layered: the panel has no redirection bitmap for a plain child to
+        // draw into; a layered child gets its own surface.
+        hexEdit_ = CreateWindowExW(WS_EX_LAYERED, L"EDIT", nullptr, WS_CHILD | ES_AUTOHSCROLL | ES_UPPERCASE, 0, 0, 10,
+                                   10, hwnd_, (HMENU)1, GetModuleHandleW(nullptr), nullptr);
+        if (!hexEdit_) return;
+        SetLayeredWindowAttributes(hexEdit_, 0, 255, LWA_ALPHA);
+        SendMessageW(hexEdit_, EM_LIMITTEXT, 6, 0);
+        SendMessageW(hexEdit_, WM_SETFONT, (WPARAM)hexFont_, FALSE);
+        SetWindowLongPtrW(hexEdit_, GWLP_USERDATA, SetWindowLongPtrW(hexEdit_, GWLP_WNDPROC, (LONG_PTR)HexEditProc));
+    }
+    if (!IsWindowVisible(hexEdit_)) {
+        wchar_t text[8];
+        swprintf_s(text, L"%06X", settings_->barCustomColor & 0xFFFFFF);
+        pickerSyncing_ = true;
+        SetWindowTextW(hexEdit_, text);
+        pickerSyncing_ = false;
+    }
+    // Inside the drawn field, between the "#" and the swatch.
+    const D2D1_RECT_F& r = hexRect_;
+    int x = panelX_ + (int)std::lround((r.left + 24) * scale_);
+    int h = (int)std::lround(fontPx * 1.4f);
+    int y = panelY_ + (int)std::lround(((r.top + r.bottom) / 2) * scale_) - h / 2;
+    int w = panelX_ + (int)std::lround((r.right - 40) * scale_) - x;
+    SetWindowPos(hexEdit_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+// Only hex digits get in. A pasted colour drops its "#" (or "0x") and, when
+// it is a whole colour, replaces the field.
+LRESULT CALLBACK Flyout::HexEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto base = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (msg == WM_CHAR && wp >= 0x20 && !iswxdigit((wint_t)wp)) return 0;
+    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {  // Esc works as elsewhere in the panel
+        SendMessageW(GetParent(hwnd), WM_KEYDOWN, wp, lp);
+        return 0;
+    }
+    if (msg == WM_PASTE) {
+        std::wstring text;
+        if (OpenClipboard(hwnd)) {
+            if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+                if (auto p = (const wchar_t*)GlobalLock(data)) {
+                    text = p;
+                    GlobalUnlock(data);
+                }
+            }
+            CloseClipboard();
+        }
+        size_t i = text.find_first_not_of(L" \t\r\n");
+        if (i == std::wstring::npos) return 0;
+        if (text[i] == L'#')
+            i++;
+        else if (text.compare(i, 2, L"0x") == 0 || text.compare(i, 2, L"0X") == 0)
+            i += 2;
+        std::wstring hex;
+        for (; i < text.size() && iswxdigit(text[i]) && hex.size() < 6; i++) hex += text[i];
+        if (hex.empty()) return 0;
+        if (hex.size() == 6) SendMessageW(hwnd, EM_SETSEL, 0, -1);
+        SendMessageW(hwnd, EM_REPLACESEL, TRUE, (LPARAM)hex.c_str());
+        return 0;
+    }
+    return CallWindowProcW(base, hwnd, msg, wp, lp);
+}
+
+static DWORD HsvToRgb(float h, float s, float v) {
+    float c = v * s, hp = std::fmod(h, 360.0f) / 60.0f, x = c * (1 - std::fabs(std::fmod(hp, 2.0f) - 1));
+    float r = 0, g = 0, b = 0;
+    if (hp < 1) r = c, g = x;
+    else if (hp < 2) r = x, g = c;
+    else if (hp < 3) g = c, b = x;
+    else if (hp < 4) g = x, b = c;
+    else if (hp < 5) r = x, b = c;
+    else r = c, b = x;
+    float m = v - c;
+    auto byte = [&](float f) { return (DWORD)std::lround(std::clamp(f + m, 0.0f, 1.0f) * 255); };
+    return (byte(r) << 16) | (byte(g) << 8) | byte(b);
+}
+
+// The picker's position from the colour. Hue (and saturation, for black) stay
+// where they were when the colour does not define them.
+void Flyout::SyncPickerFromColor() {
+    DWORD c = settings_->barCustomColor;
+    float r = ((c >> 16) & 0xFF) / 255.0f, g = ((c >> 8) & 0xFF) / 255.0f, b = (c & 0xFF) / 255.0f;
+    float mx = std::max({r, g, b}), mn = std::min({r, g, b}), d = mx - mn;
+    pickerV_ = mx;
+    if (mx > 0) pickerS_ = d / mx;
+    if (d > 0) {
+        float h = mx == r ? std::fmod((g - b) / d, 6.0f) : mx == g ? (b - r) / d + 2 : (r - g) / d + 4;
+        pickerH_ = h * 60 < 0 ? h * 60 + 360 : h * 60;
+    }
+}
+
+// Dragging in the square or along the hue bar. Saved when the drag ends.
+void Flyout::SetPickerValue(const Hit& h, float x, float y) {
+    const D2D1_RECT_F& r = h.rect;
+    if (h.kind == HitKind::ColorSV) {
+        pickerS_ = std::clamp((x - r.left) / (r.right - r.left), 0.0f, 1.0f);
+        pickerV_ = 1 - std::clamp((y - r.top) / (r.bottom - r.top), 0.0f, 1.0f);
+    } else {
+        // The hit is 4 DIPs wider than the bar on each side.
+        pickerH_ = std::clamp((x - r.left - 4) / (r.right - r.left - 8), 0.0f, 1.0f) * 359.9f;
+    }
+    DWORD c = HsvToRgb(pickerH_, pickerS_, pickerV_);
+    settings_->barCustomColor = c;
+    if (hexEdit_) {
+        wchar_t text[8];
+        swprintf_s(text, L"%06X", c);
+        pickerSyncing_ = true;
+        SetWindowTextW(hexEdit_, text);
+        pickerSyncing_ = false;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void Flyout::DrawColorPicker(const D2D1_RECT_F& sv, const D2D1_RECT_F& hue) {
+    auto gradient = [&](const D2D1_GRADIENT_STOP* stops, UINT n, D2D1_POINT_2F a, D2D1_POINT_2F b) {
+        ComPtr<ID2D1GradientStopCollection> coll;
+        ComPtr<ID2D1LinearGradientBrush> brush;
+        if (SUCCEEDED(rt_->CreateGradientStopCollection(stops, n, &coll)))
+            rt_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(a, b), coll.Get(), &brush);
+        return brush;
+    };
+
+    // Square: the hue, white towards the left, black towards the bottom.
+    D2D1_ROUNDED_RECT svr = {sv, 4, 4};
+    brush_->SetColor(Rgba(HsvToRgb(pickerH_, 1, 1)));
+    rt_->FillRoundedRectangle(svr, brush_.Get());
+    D2D1_GRADIENT_STOP white[] = {{0, D2D1::ColorF(1, 1, 1, 1)}, {1, D2D1::ColorF(1, 1, 1, 0)}};
+    if (auto b = gradient(white, 2, {sv.left, sv.top}, {sv.right, sv.top})) rt_->FillRoundedRectangle(svr, b.Get());
+    D2D1_GRADIENT_STOP black[] = {{0, D2D1::ColorF(0, 0, 0, 0)}, {1, D2D1::ColorF(0, 0, 0, 1)}};
+    if (auto b = gradient(black, 2, {sv.left, sv.top}, {sv.left, sv.bottom})) rt_->FillRoundedRectangle(svr, b.Get());
+    Stroke(sv, pal_.cardStroke, 4);
+
+    // Hue bar: red, yellow, green, cyan, blue, magenta, red.
+    D2D1_GRADIENT_STOP hues[7];
+    for (int i = 0; i < 7; i++) hues[i] = {i / 6.0f, Rgba(HsvToRgb(i * 60.0f, 1, 1))};
+    float rad = (hue.bottom - hue.top) / 2;
+    if (auto b = gradient(hues, 7, {hue.left, hue.top}, {hue.right, hue.top}))
+        rt_->FillRoundedRectangle({hue, rad, rad}, b.Get());
+    Stroke(hue, pal_.cardStroke, rad);
+
+    // Handles: white rings with a thin dark edge, filled with their colour.
+    auto handle = [&](D2D1_POINT_2F p, float r, DWORD color) {
+        brush_->SetColor(Rgba(color));
+        rt_->FillEllipse(D2D1::Ellipse(p, r, r), brush_.Get());
+        brush_->SetColor(Rgba(0xFFFFFF));
+        rt_->DrawEllipse(D2D1::Ellipse(p, r, r), brush_.Get(), 2.0f);
+        brush_->SetColor(Rgba(0x000000, 0.35f));
+        rt_->DrawEllipse(D2D1::Ellipse(p, r + 1.5f, r + 1.5f), brush_.Get(), 1.0f);
+    };
+    handle({sv.left + pickerS_ * (sv.right - sv.left), sv.top + (1 - pickerV_) * (sv.bottom - sv.top)}, 6,
+           HsvToRgb(pickerH_, pickerS_, pickerV_));
+    handle({hue.left + pickerH_ / 360.0f * (hue.right - hue.left), (hue.top + hue.bottom) / 2}, rad - 1,
+           HsvToRgb(pickerH_, 1, 1));
 }

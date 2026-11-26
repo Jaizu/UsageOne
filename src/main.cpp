@@ -61,6 +61,7 @@ bool TaskbarIsLight() {
 std::wstring TrayTip() {
     std::wstring tip;
     for (const Limit& l : g_state.data.limits) {
+        if (!g_settings.showModelWeeks && Usage::IsModelWeek(l)) continue;
         if (!tip.empty()) tip += L"\n";
         tip += LimitName(l.key) + L": " + std::to_wstring(l.percent) + L"%";
         if (l.key == L"session" && l.resetAt) {
@@ -113,11 +114,81 @@ void RemoveTray() {
     g_trayAdded = false;
 }
 
+// --- Status pipe for the Stream Deck plugin -----------------------------------
+
+SRWLOCK g_statusLock = SRWLOCK_INIT;
+std::string g_statusJson;  // UTF-8, rebuilt on the UI thread whenever the state changes
+
+std::string Utf8(const std::wstring& s) {
+    if (s.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+// {"status":"ok","probing":false,"plan":"Max 5x","session":91,"sessionReset":1764166140,
+//  "week":67,"weekReset":1764280000}. Resets are Unix seconds, 0 when not started;
+// a missing limit is -1.
+void PublishStatus() {
+    static const char* kStatus[] = {"none", "ok", "noClaude", "notLoggedIn", "noLimits", "failed"};
+    auto unix = [](ULONGLONG t) -> long long { return t ? (long long)((t - 116444736000000000ULL) / Usage::kSecond) : 0; };
+    int session = -1, week = -1;
+    long long sessionReset = 0, weekReset = 0;
+    for (const Limit& l : g_state.data.limits) {
+        if (l.key == L"session") session = l.percent, sessionReset = unix(l.resetAt);
+        if (l.key == L"all models") week = l.percent, weekReset = unix(l.resetAt);
+    }
+    std::string plan;
+    for (char c : Utf8(g_state.data.plan.name))
+        if (c != '"' && c != '\\') plan += c;
+    char buf[512];
+    sprintf_s(buf,
+              "{\"status\":\"%s\",\"probing\":%s,\"plan\":\"%s\",\"session\":%d,\"sessionReset\":%lld,"
+              "\"week\":%d,\"weekReset\":%lld}\n",
+              kStatus[g_state.last], g_state.probing ? "true" : "false", plan.c_str(), session, sessionReset, week,
+              weekReset);
+    AcquireSRWLockExclusive(&g_statusLock);
+    g_statusJson = buf;
+    ReleaseSRWLockExclusive(&g_statusLock);
+}
+
+// One client at a time, one request per connection: a line in, a line out.
+DWORD WINAPI PipeThread(void*) {
+    for (;;) {
+        HANDLE pipe = CreateNamedPipeW(STATUS_PIPE_NAME, PIPE_ACCESS_DUPLEX,
+                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
+                                       4096, 4096, 0, nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            LOG(L"pipe: CreateNamedPipe failed (%lu)", GetLastError());
+            return 1;
+        }
+        if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+            char req[64] = {};
+            DWORD got = 0, total = 0;
+            while (total < sizeof(req) - 1 && ReadFile(pipe, req + total, sizeof(req) - 1 - total, &got, nullptr) && got) {
+                total += got;
+                if (memchr(req, '\n', total)) break;
+            }
+            if (strncmp(req, "refresh", 7) == 0) PostMessageW(g_host, WM_APP_REFRESH, 0, 0);
+            AcquireSRWLockShared(&g_statusLock);
+            std::string reply = g_statusJson;
+            ReleaseSRWLockShared(&g_statusLock);
+            DWORD wrote = 0;
+            WriteFile(pipe, reply.data(), (DWORD)reply.size(), &wrote, nullptr);
+            FlushFileBuffers(pipe);
+            DisconnectNamedPipe(pipe);
+        }
+        CloseHandle(pipe);
+    }
+}
+
 // --- Probing ------------------------------------------------------------------
 
 void StartProbe() {
     if (g_state.probing) return;
     g_state.probing = true;
+    PublishStatus();
     if (g_flyoutCreated) g_flyout.OnUsageChanged();
     HANDLE h = CreateThread(nullptr, 0, [](void*) -> DWORD {
         auto d = new UsageData(Usage::Probe());
@@ -126,8 +197,10 @@ void StartProbe() {
     }, nullptr, 0, nullptr);
     if (h)
         CloseHandle(h);
-    else
+    else {
         g_state.probing = false;
+        PublishStatus();
+    }
 }
 
 void ScheduleRefresh(UINT ms) {
@@ -147,6 +220,7 @@ void OnProbeDone(UsageData* d) {
     bool ok = g_state.last == UsageData::Ok;
     // Without numbers, try again sooner.
     ScheduleRefresh(ok || !g_state.data.limits.empty() ? g_settings.refreshMinutes * 60000u : 60000u);
+    PublishStatus();
     UpdateTray();
     if (g_flyoutCreated) g_flyout.OnUsageChanged();
 }
@@ -242,6 +316,10 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             OnProbeDone((UsageData*)lp);
             return 0;
 
+        case WM_APP_REFRESH:
+            StartProbe();
+            return 0;
+
         case WM_TIMER:
             if (wp == kTimerRefresh) {
                 KillTimer(hwnd, kTimerRefresh);
@@ -322,6 +400,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
 
     g_state.data.plan = Usage::ReadPlan();
     UpdateTray();
+    PublishStatus();
+    if (HANDLE h = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr)) CloseHandle(h);
+    // Where we are, so the Stream Deck plugin can start us when its key is pressed.
+    {
+        wchar_t exe[MAX_PATH];
+        DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\" APP_NAME, L"AppPath", REG_SZ, exe, (n + 1) * sizeof(wchar_t));
+    }
     StartProbe();
     SetTimer(g_host, kTimerTray, 60 * 1000, nullptr);
     if (!background) PostMessageW(g_host, WM_APP_SHOW_FLYOUT, 0, 0);
