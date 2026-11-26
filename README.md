@@ -1,4 +1,4 @@
-﻿# UsageOne
+# UsageOne
 
 Your Claude plan limits in the Windows 11 tray: the current session, the weekly limits, when each one resets, your plan and the peak hours, in a panel with the Windows look (acrylic, shadow, accent colour) that opens right above the tray icon.
 
@@ -24,4 +24,4 @@ Needs Visual Studio (or the Build Tools) with "Desktop development with C++". It
 powershell -ExecutionPolicy Bypass -File tools\install-plugin.ps1
 ```
 
-Copies the plugin into Stream Deck's plugin folder (with its manifest and images) and restarts Stream Deck. Then drag **UsageOne â€º Claude usage** onto a key. The key reads the numbers from the running UsageOne; if UsageOne is closed, pressing the key starts it.
+Copies the plugin into Stream Deck's plugin folder (with its manifest and images) and restarts Stream Deck. Then drag **UsageOne › Claude usage** onto a key. The key reads the numbers from the running UsageOne; if UsageOne is closed, pressing the key starts it.
