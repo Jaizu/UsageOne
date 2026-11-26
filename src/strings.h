@@ -31,7 +31,7 @@ struct Strings {
     const wchar_t* settings;
     const wchar_t* startWithWindows;
     const wchar_t* showPeak;
-    const wchar_t* trayWeek;
+    const wchar_t* starIcon;
     const wchar_t* openWeb;
     const wchar_t* refresh;
     const wchar_t* exit;

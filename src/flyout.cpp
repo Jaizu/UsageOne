@@ -485,9 +485,10 @@ void Flyout::Show(bool settingsView) {
     transition_.Set(1);
     hover_ = pressed_ = Hit{};
     startup_ = GetStartWithWindows();
-    // Bars start empty and fill once the panel is in place.
+    // Bars open at their value; they only move when new numbers arrive.
     bars_.assign(usage_->data.limits.size(), Anim{});
     barTargets_.assign(usage_->data.limits.size(), -1);
+    StartBars(true);
 
     Reposition();
     DwmFlush();
@@ -525,7 +526,6 @@ void Flyout::Show(bool settingsView) {
         g_hookOwner = this;
         g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
     }
-    StartBars(true);
 }
 
 void Flyout::Hide() {
@@ -607,9 +607,9 @@ void Flyout::OnThemeChanged() {
     if (visible_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-// Bars ease to their value: from empty when the panel opens, from where they
-// are when new numbers arrive.
-void Flyout::StartBars(bool fromZero) {
+// Bars jump to their value when the panel opens (`instant`) and ease from
+// where they are when new numbers arrive while it's open.
+void Flyout::StartBars(bool instant) {
     const auto& limits = usage_->data.limits;
     if (bars_.size() != limits.size()) {
         bars_.resize(limits.size());
@@ -617,12 +617,15 @@ void Flyout::StartBars(bool fromZero) {
     }
     bool any = false;
     for (size_t i = 0; i < limits.size(); i++) {
-        if (fromZero) bars_[i].Set(0);
-        if (fromZero || barTargets_[i] != limits[i].percent) {
-            bars_[i].Go(limits[i].percent / 100.0f, fromZero ? 700.0f + 90.0f * i : 450.0f);
-            barTargets_[i] = limits[i].percent;
+        if (barTargets_[i] == limits[i].percent) continue;
+        float v = limits[i].percent / 100.0f;
+        if (instant || barTargets_[i] < 0) {
+            bars_[i].Set(v);
+        } else {
+            bars_[i].Go(v, 450.0f);
             any = true;
         }
+        barTargets_[i] = limits[i].percent;
     }
     if (any) StartFramePump();
 }
@@ -816,12 +819,13 @@ float Flyout::LayoutMain(float y, bool draw) {
     }
     y += 24;
     if (!d.plan.name.empty()) {
-        std::wstring plan = d.plan.periodEnd ? Format(S().planUntil, d.plan.name, ShortDate(d.plan.periodEnd))
-                                             : Format(S().planOnly, d.plan.name);
+        // Only the plan: the billing date isn't available locally, and estimating it
+        // from the subscription start was wrong (an upgrade moves the billing day).
+        std::wstring plan = Format(S().planOnly, d.plan.name);
         if (draw) Text(plan, fCaption_.Get(), {x0, y + 2, x1, y + 20}, pal_.textSecondary);
         y += 20;
     }
-    y += 18;
+    y += 4;  // the big number's line box already leaves room above it
 
     if (d.limits.empty()) {
         const wchar_t* msg = S().loading;
@@ -910,7 +914,7 @@ float Flyout::LayoutSettings(float y, bool draw) {
     const Row rows[] = {
         {HitKind::ToggleStartup, S().startWithWindows, startup_},
         {HitKind::TogglePeak, S().showPeak, settings_->showPeak},
-        {HitKind::ToggleTrayWeek, S().trayWeek, settings_->trayWeek},
+        {HitKind::ToggleStar, S().starIcon, settings_->starIcon},
     };
     const float rh = 52;
     float top = y, h = rh * ARRAYSIZE(rows);
@@ -1066,10 +1070,10 @@ void Flyout::Activate(const Hit& h) {
             settings_->showPeak = !settings_->showPeak;
             settings_->Save();
             break;
-        case HitKind::ToggleTrayWeek:
-            settings_->trayWeek = !settings_->trayWeek;
+        case HitKind::ToggleStar:
+            settings_->starIcon = !settings_->starIcon;
             settings_->Save();
-            if (onTraySettingChanged) onTraySettingChanged();
+            if (onTrayIconChanged) onTrayIconChanged();
             break;
         case HitKind::OpenWeb:
             Hide();

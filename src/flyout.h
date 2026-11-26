@@ -59,7 +59,7 @@ struct Anim {
 class Flyout {
 public:
     std::function<void()> onRefresh;
-    std::function<void()> onTraySettingChanged;
+    std::function<void()> onTrayIconChanged;
 
     bool Create(HINSTANCE inst, HWND owner, const UsageState* usage, Settings* settings);
     void Toggle();
@@ -74,7 +74,7 @@ public:
 
 private:
     enum class View { Main, Settings };
-    enum class HitKind { None, Refresh, Gear, Back, ToggleStartup, TogglePeak, ToggleTrayWeek, OpenWeb };
+    enum class HitKind { None, Refresh, Gear, Back, ToggleStartup, TogglePeak, ToggleStar, OpenWeb };
     struct Hit {
         HitKind kind = HitKind::None;
         D2D1_RECT_F rect{};
@@ -136,7 +136,7 @@ private:
     void StartFramePump();
     void QueueFrame();
     void AnimFrame();
-    void StartBars(bool fromZero);
+    void StartBars(bool instant);
 
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;

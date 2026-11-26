@@ -31,7 +31,7 @@ set LFLAGS=/LTCG /OPT:REF /OPT:ICF /INCREMENTAL:NO
 
 rc /nologo /fo obj\app.res res\app.rc || exit /b 1
 
-cl %CFLAGS% src\main.cpp src\flyout.cpp src\usage.cpp src\settings.cpp src\strings.cpp src\log.cpp obj\app.res ^
+cl %CFLAGS% src\main.cpp src\flyout.cpp src\usage.cpp src\settings.cpp src\strings.cpp src\trayicon.cpp src\log.cpp obj\app.res ^
    /Fe:"%OUT%\UsageOne.exe" /link %LFLAGS% /SUBSYSTEM:WINDOWS ^
    user32.lib gdi32.lib shell32.lib ole32.lib advapi32.lib dwmapi.lib d2d1.lib dwrite.lib shcore.lib ^
    d3d11.lib coremessaging.lib windowsapp.lib || exit /b 1

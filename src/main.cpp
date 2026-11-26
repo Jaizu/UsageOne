@@ -2,6 +2,7 @@
 #include "flyout.h"
 #include "log.h"
 #include "settings.h"
+#include "trayicon.h"
 #include "strings.h"
 #include "usage.h"
 
@@ -57,60 +58,6 @@ bool TaskbarIsLight() {
     return light != 0;
 }
 
-const Limit* TrayLimit() {
-    const auto& limits = g_state.data.limits;
-    const wchar_t* want = g_settings.trayWeek ? L"all models" : L"session";
-    for (const Limit& l : limits)
-        if (l.key == want) return &l;
-    return limits.empty() ? nullptr : &limits[0];
-}
-
-// Text rendered white on black, its coverage used as alpha, in `color`.
-HICON MakeTextIcon(const std::wstring& text, COLORREF color) {
-    int size = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem());
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = size;
-    bi.bmiHeader.biHeight = -size;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bmp) return nullptr;
-    memset(bits, 0, size * size * 4);
-    HDC dc = CreateCompatibleDC(nullptr);
-    HGDIOBJ oldBmp = SelectObject(dc, bmp);
-    // Condensed digits fit two to an icon at a readable size.
-    int em = text.size() >= 3 ? size * 72 / 100 : size * 104 / 100;
-    HFONT font = CreateFontW(-em, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Bahnschrift SemiBold SemiCondensed");
-    HGDIOBJ oldFont = SelectObject(dc, font);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    RECT rc = {-2, 0, size + 2, size};
-    DrawTextW(dc, text.c_str(), (int)text.size(), &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    GdiFlush();
-    auto px = (BYTE*)bits;
-    for (int i = 0; i < size * size; i++, px += 4) {
-        BYTE a = px[1];
-        px[0] = (BYTE)(GetBValue(color) * a / 255);
-        px[1] = (BYTE)(GetGValue(color) * a / 255);
-        px[2] = (BYTE)(GetRValue(color) * a / 255);
-        px[3] = a;
-    }
-    SelectObject(dc, oldFont);
-    SelectObject(dc, oldBmp);
-    DeleteObject(font);
-    DeleteDC(dc);
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
-    ICONINFO ii = {TRUE, 0, 0, mask, bmp};
-    HICON icon = CreateIconIndirect(&ii);
-    DeleteObject(mask);
-    DeleteObject(bmp);
-    return icon;
-}
-
 std::wstring TrayTip() {
     std::wstring tip;
     for (const Limit& l : g_state.data.limits) {
@@ -126,18 +73,12 @@ std::wstring TrayTip() {
     return tip;
 }
 
+// Claude Code's mascot (or the Claude star, a setting) in the taskbar's text
+// colour: white on a dark taskbar, black on a light one. The numbers are in
+// the tooltip and the panel.
 void UpdateTray() {
     bool light = TaskbarIsLight();
-    const Limit* l = TrayLimit();
-    COLORREF color = light ? RGB(0x1A, 0x1A, 0x1A) : RGB(0xFF, 0xFF, 0xFF);
-    std::wstring text = L"–";
-    if (l) {
-        text = std::to_wstring(l->percent);
-        if (l->percent >= 85)
-            color = light ? RGB(0xC4, 0x2B, 0x1C) : RGB(0xFF, 0x99, 0xA4);
-        else if (l->percent >= 60)
-            color = light ? RGB(0x9D, 0x5D, 0x00) : RGB(0xFC, 0xE1, 0x00);
-    }
+    COLORREF color = light ? RGB(0x00, 0x00, 0x00) : RGB(0xFF, 0xFF, 0xFF);
 
     NOTIFYICONDATAW nid = {sizeof(nid)};
     nid.hWnd = g_host;
@@ -145,7 +86,7 @@ void UpdateTray() {
     nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | NIF_ICON;
     nid.uCallbackMessage = WM_APP_TRAY;
     HICON oldIcon = g_trayIcon;
-    g_trayIcon = MakeTextIcon(text, color);
+    g_trayIcon = MakeTrayIcon(GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()), color, g_settings.starIcon);
     nid.hIcon = g_trayIcon;
     wcsncpy_s(nid.szTip, TrayTip().c_str(), _TRUNCATE);
 
@@ -223,7 +164,7 @@ void EnsureFlyout() {
         return;
     }
     g_flyout.onRefresh = [] { StartProbe(); };
-    g_flyout.onTraySettingChanged = [] { UpdateTray(); };
+    g_flyout.onTrayIconChanged = [] { UpdateTray(); };
 }
 
 void ShowFlyout(bool settings) {
@@ -344,6 +285,13 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
     g_inst = inst;
+
+    // Development aid: draw the tray icons at several sizes into a BMP and exit.
+    if (const wchar_t* p = wcsstr(cmdLine, L"/icon-preview ")) {
+        std::wstring path = p + 14;
+        path.erase(std::remove(path.begin(), path.end(), L'"'), path.end());
+        return WriteIconPreview(path.c_str()) ? 0 : 1;
+    }
 
     // Single instance: a second launch opens the running one's panel.
     g_runningMutex = CreateMutexW(nullptr, FALSE, RUNNING_MUTEX_NAME);

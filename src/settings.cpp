@@ -15,13 +15,13 @@ static void WriteDword(const wchar_t* name, DWORD v) {
 
 void Settings::Load() {
     showPeak = ReadDword(L"ShowPeak", 1) != 0;
-    trayWeek = ReadDword(L"TrayWeek", 0) != 0;
+    starIcon = ReadDword(L"StarIcon", 0) != 0;
     refreshMinutes = (int)std::clamp<DWORD>(ReadDword(L"RefreshMinutes", 5), 1, 60);
 }
 
 void Settings::Save() const {
     WriteDword(L"ShowPeak", showPeak);
-    WriteDword(L"TrayWeek", trayWeek);
+    WriteDword(L"StarIcon", starIcon);
     WriteDword(L"RefreshMinutes", refreshMinutes);
 }
 

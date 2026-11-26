@@ -5,7 +5,7 @@
 // Kept in HKCU\Software\UsageOne. "Start with Windows" is the Run key itself.
 struct Settings {
     bool showPeak = true;      // peak hours row
-    bool trayWeek = false;     // the tray number shows the week instead of the session
+    bool starIcon = false;     // tray icon: the Claude star instead of the mascot
     int refreshMinutes = 5;
 
     void Load();
