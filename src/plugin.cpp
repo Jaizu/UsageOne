@@ -156,6 +156,18 @@ bool StartUsageOne() {
     return (INT_PTR)ShellExecuteW(nullptr, L"open", exe, L"/background", dir.c_str(), SW_SHOWNORMAL) > 32;
 }
 
+// Holding the key: the Claude desktop app (brought forward if it's already
+// open), or claude.ai when it isn't installed.
+const DWORD kLongPressMs = 500;
+
+void OpenClaude() {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);  // ShellExecute wants STA
+    INT_PTR r = (INT_PTR)ShellExecuteW(nullptr, L"open", L"shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude", nullptr,
+                                       nullptr, SW_SHOWNORMAL);
+    if (r <= 32) r = (INT_PTR)ShellExecuteW(nullptr, L"open", L"https://claude.ai", nullptr, nullptr, SW_SHOWNORMAL);
+    Log("long press: opening Claude (%s)", r > 32 ? "ok" : "failed");
+}
+
 // --- Text ---------------------------------------------------------------------
 
 struct Texts {
@@ -607,7 +619,32 @@ private:
             std::lock_guard<std::mutex> lock(lock_);
             contexts_.erase(context);
         } else if (ev == "keyDown") {
-            Wake(true);
+            // A tap refreshes (on release); holding it opens Claude.
+            int press;
+            {
+                std::lock_guard<std::mutex> lock(lock_);
+                press = ++press_;
+                held_ = true;
+                longFired_ = false;
+            }
+            std::thread([this, press, context] {
+                Sleep(kLongPressMs);
+                {
+                    std::lock_guard<std::mutex> lock(lock_);
+                    if (press != press_ || !held_) return;
+                    longFired_ = true;
+                }
+                OpenClaude();
+                Send("{\"event\":\"showOk\",\"context\":\"" + context + "\"}");
+            }).detach();
+        } else if (ev == "keyUp") {
+            bool tap;
+            {
+                std::lock_guard<std::mutex> lock(lock_);
+                held_ = false;
+                tap = !longFired_;
+            }
+            if (tap) Wake(true);
         } else if (ev == "systemDidWakeUp") {
             Wake(false);
         }
@@ -702,6 +739,8 @@ private:
     std::mutex lock_;
     std::condition_variable cv_;
     bool wake_ = false, keyPressed_ = false;
+    int press_ = 0;                          // counts key presses, to tell a hold from the next one
+    bool held_ = false, longFired_ = false;  // the key is down / this press already opened Claude
     std::set<std::string> contexts_;
     std::string lastImage_;
 };

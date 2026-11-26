@@ -23,7 +23,7 @@
     {
       "UUID": "com.jaizu.usageone.usage",
       "Name": "Claude usage",
-      "Tooltip": "Session and weekly usage of your Claude plan. Press to refresh.",
+      "Tooltip": "Session and weekly usage of your Claude plan. Press to refresh, hold to open Claude.",
       "Icon": "imgs/action",
       "Controllers": ["Keypad"],
       "SupportedInMultiActions": false,
