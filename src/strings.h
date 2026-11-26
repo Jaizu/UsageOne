@@ -34,6 +34,27 @@ struct Strings {
     const wchar_t* starIcon;
     const wchar_t* showModelWeeks;
     const wchar_t* showRow;        // %s = a row's name: "Show Weekly · Fable"
+    const wchar_t* streamDeck;
+    const wchar_t* pluginLabel;
+    const wchar_t* sectionGeneral;
+    const wchar_t* sectionPanel;
+    const wchar_t* streamDeckMissing;
+    const wchar_t* pluginNotInstalled;
+    const wchar_t* pluginOutdated;   // %s = installed version
+    const wchar_t* pluginInstalled;  // %s = installed version
+    const wchar_t* install;
+    const wchar_t* reinstall;
+    const wchar_t* installing;
+    const wchar_t* installFailed;
+    const wchar_t* updates;
+    const wchar_t* versionLine;      // %s
+    const wchar_t* checkUpdates;
+    const wchar_t* checking;
+    const wchar_t* upToDate;
+    const wchar_t* checkFailed;
+    const wchar_t* updateAvailable;  // %s
+    const wchar_t* updateNow;
+    const wchar_t* whatsNew;         // %s
     const wchar_t* barColor;
     const wchar_t* barColorDesc;
     const wchar_t* barAccent;

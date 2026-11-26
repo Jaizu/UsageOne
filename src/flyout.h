@@ -2,6 +2,8 @@
 
 #include "common.h"
 #include "settings.h"
+#include "streamdeck.h"
+#include "updater.h"
 #include "usage.h"
 
 #include <d2d1_1.h>
@@ -58,10 +60,14 @@ struct Anim {
 
 class Flyout {
 public:
+    static inline int themeOverride = 0;  // 0 = follow Windows, 1 = light, 2 = dark (/theme, for screenshots)
     std::function<void()> onRefresh;
     std::function<void()> onTrayIconChanged;
+    std::function<void()> onCheckUpdates, onInstallUpdate, onInstallPlugin;
 
-    bool Create(HINSTANCE inst, HWND owner, const UsageState* usage, Settings* settings);
+    bool Create(HINSTANCE inst, HWND owner, const UsageState* usage, Settings* settings, const UpdateState* update,
+                const PluginState* plugin);
+    void OnStateChanged();   // update or plugin state changed: re-layout if open
     void Toggle();
     void Show(bool settingsView = false);
     void Hide();
@@ -76,13 +82,13 @@ private:
     enum class View { Main, Settings };
     enum class HitKind {
         None, Refresh, Gear, Back, ToggleStartup, TogglePeak, ToggleStar, ToggleModelWeeks, OpenWeb,
-        BarOption, ColorSwatch, ColorSV, ColorHue,
+        Section, BarOption, ColorSwatch, ColorSV, ColorHue, CheckUpdates, InstallUpdate, InstallPlugin,
     };
     struct Hit {
         HitKind kind = HitKind::None;
         D2D1_RECT_F rect{};
         bool footer = false;  // in the fixed footer
-        int index = 0;        // which bar colour option
+        int index = 0;        // which bar colour option or section
         bool operator==(const Hit& o) const { return kind == o.kind && index == o.index; }
     };
 
@@ -111,6 +117,7 @@ private:
     D2D1_POINT_2F ToPanel(int clientX, int clientY) const;
     int panelX_ = 0, panelY_ = 0, panelW_ = 0, panelH_ = 0;  // client pixels
     int panelEdge_ = 0;       // y of the edge that stays put (next to the taskbar)
+    int loggedH_ = 0;         // last panel height written to the log
     bool anchorTop_ = false;  // taskbar at the top: the panel grows down
     RECT region_{};
     D2D1::Matrix3x2F drawBase_ = D2D1::Matrix3x2F::Identity();
@@ -166,6 +173,20 @@ private:
     int slideDx_ = 0, slideDy_ = 1;
     const UsageState* usage_ = nullptr;
     Settings* settings_ = nullptr;
+    const UpdateState* update_ = nullptr;
+    const PluginState* plugin_ = nullptr;
+    bool upToDateStale_ = false;  // "Up to date" was already seen: the button says "Check" again
+    float LayoutBarColor(float y, bool draw, bool settled);
+    float LayoutUpdates(float y, bool draw);
+    void DrawChevron(const D2D1_RECT_F& r, const D2D1_COLOR_F& c, float open);
+
+    // Collapsible Settings sections (General, Panel, Stream Deck); General starts open.
+    static const int kSections = 3;
+    bool sectionOpen_[kSections] = {true, false, false};
+    Anim sectionAnim_[kSections] = {{1, 1, 1, 0}, {}, {}};
+
+    float CardButtonRow(float y, const std::wstring& label, const std::wstring& status, const wchar_t* button,
+                        HitKind kind, bool accent, bool enabled, bool draw);
     bool visible_ = false;
     ULONGLONG lastHideTick_ = 0;
     View view_ = View::Main;

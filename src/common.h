@@ -34,7 +34,13 @@ enum : UINT {
     WM_APP_SHOW_FLYOUT,        // second instance asked us to open
     WM_APP_PROBE_DONE,         // usage probe finished (lParam = UsageData*)
     WM_APP_REFRESH,            // the Stream Deck key asked for fresh numbers
+    WM_APP_UPDATE_CHECKED,     // update check finished (lParam = Updater::ReleaseInfo*, may be null)
+    WM_APP_UPDATE_INSTALLED,   // update install finished (wParam = ok)
+    WM_APP_PLUGIN_INSTALLED,   // Stream Deck plugin install finished (wParam = ok)
 };
+
+// Stream Deck plugin folder name (its manifest UUID + ".sdPlugin").
+#define PLUGIN_UUID L"com.jaizu.usageone"
 
 // The Stream Deck plugin asks the running app for its numbers through this
 // pipe: it writes "status" or "refresh" and a newline, and gets one line of

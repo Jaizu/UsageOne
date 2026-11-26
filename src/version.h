@@ -1,8 +1,8 @@
 #pragma once
 
 // Single source of the app version (used by the code and res\app.rc).
-#define VERSION_MAJOR 0
-#define VERSION_MINOR 1
+#define VERSION_MAJOR 1
+#define VERSION_MINOR 0
 #define VERSION_PATCH 0
 
 #define VERSION_STR2(a, b, c) #a "." #b "." #c

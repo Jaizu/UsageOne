@@ -6,7 +6,7 @@ $exe = "$root\bin\UsageOne.exe"
 Get-Process UsageOne -ErrorAction SilentlyContinue | Stop-Process -Force
 Get-Process UsageOne -ErrorAction SilentlyContinue | Wait-Process -Timeout 10
 
-& cmd /c "`"$root\build.cmd`""
+& cmd /c "`"$root\build.cmd`" dev"
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 
 # Launch through WMI rather than Start-Process: a direct child of a packaged

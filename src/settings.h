@@ -18,3 +18,5 @@ struct Settings {
 
 bool GetStartWithWindows();
 void SetStartWithWindows(bool enable);
+// Turns it on at the first run, and keeps the entry pointing at this exe.
+void InitStartWithWindows();

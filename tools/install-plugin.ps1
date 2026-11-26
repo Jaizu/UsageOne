@@ -1,14 +1,14 @@
-# Installs (or updates) the Stream Deck plugin from bin\ (build it first with
-# tools\dev.ps1) and restarts Stream Deck so it loads it.
+# Installs (or updates) the Stream Deck plugin from obj\ (build it first with
+# tools\dev.ps1; users install it from UsageOne's Settings) and restarts Stream Deck so it loads it.
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path "$PSScriptRoot\.."
-$exe = "$root\bin\UsageOne.StreamDeck.exe"
+$exe = "$root\obj\UsageOne.StreamDeck.exe"
 if (-not (Test-Path $exe)) { throw "Build first: tools\dev.ps1" }
 
 # Through WMI, outside the Claude desktop app's process tree: its children
 # get AppData virtualization, and the plugin folder must be the real one.
 $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-    CommandLine = "`"$exe`" /install"; CurrentDirectory = "$root\bin" }
+    CommandLine = "`"$exe`" /install"; CurrentDirectory = "$root\obj" }
 if ($r.ReturnValue -ne 0) { throw "Launch failed ($($r.ReturnValue))." }
 Wait-Process -Id $r.ProcessId -Timeout 60 -ErrorAction SilentlyContinue
 

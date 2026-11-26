@@ -45,6 +45,20 @@ bool GetStartWithWindows() {
     return _wcsicmp(buf, RunCommand().c_str()) == 0;
 }
 
+// On the first run, start with Windows (the user can turn it off in Settings).
+// Later, if the exe has moved, the startup entry follows it.
+void InitStartWithWindows() {
+    if (ReadDword(L"FirstRunDone", 0) == 0) {
+        SetStartWithWindows(true);
+        WriteDword(L"FirstRunDone", 1);
+        return;
+    }
+    wchar_t buf[MAX_PATH * 2];
+    DWORD size = sizeof(buf);
+    bool hasEntry = RegGetValueW(HKEY_CURRENT_USER, kRunKey, APP_NAME, RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS;
+    if (hasEntry && !GetStartWithWindows()) SetStartWithWindows(true);
+}
+
 void SetStartWithWindows(bool enable) {
     HKEY key;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) return;

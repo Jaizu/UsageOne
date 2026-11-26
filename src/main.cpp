@@ -2,8 +2,11 @@
 #include "flyout.h"
 #include "log.h"
 #include "settings.h"
+#include "statuspipe.h"
+#include "streamdeck.h"
 #include "trayicon.h"
 #include "strings.h"
+#include "updater.h"
 #include "usage.h"
 
 #include <shellscalingapi.h>
@@ -14,6 +17,8 @@ const UINT kTrayId = 1;
 const UINT_PTR kTimerTrayRetry = 1;
 const UINT_PTR kTimerRefresh = 2;
 const UINT_PTR kTimerTray = 3;  // tooltip countdowns
+const UINT_PTR kTimerUpdateCheck = 4;
+const UINT kUpdateCheckIntervalMs = 24 * 60 * 60 * 1000;
 const ULONGLONG kStaleOnOpen = 60 * Usage::kSecond;  // opening the panel refreshes older data
 
 enum MenuId { IdRefresh = 1, IdSettings, IdWeb, IdExit };
@@ -28,6 +33,10 @@ Flyout g_flyout;
 bool g_flyoutCreated = false;
 bool g_trayAdded = false;
 HICON g_trayIcon = nullptr;
+UpdateState g_update;
+Updater::ReleaseInfo g_release;
+bool g_updateManual = false;  // the user clicked "Check": also report "Up to date"
+PluginState g_plugin;
 
 // --- Dark context menu (undocumented uxtheme exports) ------------------------
 
@@ -114,81 +123,12 @@ void RemoveTray() {
     g_trayAdded = false;
 }
 
-// --- Status pipe for the Stream Deck plugin -----------------------------------
-
-SRWLOCK g_statusLock = SRWLOCK_INIT;
-std::string g_statusJson;  // UTF-8, rebuilt on the UI thread whenever the state changes
-
-std::string Utf8(const std::wstring& s) {
-    if (s.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
-    std::string out(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), n, nullptr, nullptr);
-    return out;
-}
-
-// {"status":"ok","probing":false,"plan":"Max 5x","session":91,"sessionReset":1764166140,
-//  "week":67,"weekReset":1764280000}. Resets are Unix seconds, 0 when not started;
-// a missing limit is -1.
-void PublishStatus() {
-    static const char* kStatus[] = {"none", "ok", "noClaude", "notLoggedIn", "noLimits", "failed"};
-    auto unix = [](ULONGLONG t) -> long long { return t ? (long long)((t - 116444736000000000ULL) / Usage::kSecond) : 0; };
-    int session = -1, week = -1;
-    long long sessionReset = 0, weekReset = 0;
-    for (const Limit& l : g_state.data.limits) {
-        if (l.key == L"session") session = l.percent, sessionReset = unix(l.resetAt);
-        if (l.key == L"all models") week = l.percent, weekReset = unix(l.resetAt);
-    }
-    std::string plan;
-    for (char c : Utf8(g_state.data.plan.name))
-        if (c != '"' && c != '\\') plan += c;
-    char buf[512];
-    sprintf_s(buf,
-              "{\"status\":\"%s\",\"probing\":%s,\"plan\":\"%s\",\"session\":%d,\"sessionReset\":%lld,"
-              "\"week\":%d,\"weekReset\":%lld}\n",
-              kStatus[g_state.last], g_state.probing ? "true" : "false", plan.c_str(), session, sessionReset, week,
-              weekReset);
-    AcquireSRWLockExclusive(&g_statusLock);
-    g_statusJson = buf;
-    ReleaseSRWLockExclusive(&g_statusLock);
-}
-
-// One client at a time, one request per connection: a line in, a line out.
-DWORD WINAPI PipeThread(void*) {
-    for (;;) {
-        HANDLE pipe = CreateNamedPipeW(STATUS_PIPE_NAME, PIPE_ACCESS_DUPLEX,
-                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
-                                       4096, 4096, 0, nullptr);
-        if (pipe == INVALID_HANDLE_VALUE) {
-            LOG(L"pipe: CreateNamedPipe failed (%lu)", GetLastError());
-            return 1;
-        }
-        if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
-            char req[64] = {};
-            DWORD got = 0, total = 0;
-            while (total < sizeof(req) - 1 && ReadFile(pipe, req + total, sizeof(req) - 1 - total, &got, nullptr) && got) {
-                total += got;
-                if (memchr(req, '\n', total)) break;
-            }
-            if (strncmp(req, "refresh", 7) == 0) PostMessageW(g_host, WM_APP_REFRESH, 0, 0);
-            AcquireSRWLockShared(&g_statusLock);
-            std::string reply = g_statusJson;
-            ReleaseSRWLockShared(&g_statusLock);
-            DWORD wrote = 0;
-            WriteFile(pipe, reply.data(), (DWORD)reply.size(), &wrote, nullptr);
-            FlushFileBuffers(pipe);
-            DisconnectNamedPipe(pipe);
-        }
-        CloseHandle(pipe);
-    }
-}
-
 // --- Probing ------------------------------------------------------------------
 
 void StartProbe() {
     if (g_state.probing) return;
     g_state.probing = true;
-    PublishStatus();
+    StatusPipe::Publish(g_state);
     if (g_flyoutCreated) g_flyout.OnUsageChanged();
     HANDLE h = CreateThread(nullptr, 0, [](void*) -> DWORD {
         auto d = new UsageData(Usage::Probe());
@@ -199,7 +139,7 @@ void StartProbe() {
         CloseHandle(h);
     else {
         g_state.probing = false;
-        PublishStatus();
+        StatusPipe::Publish(g_state);
     }
 }
 
@@ -220,9 +160,77 @@ void OnProbeDone(UsageData* d) {
     bool ok = g_state.last == UsageData::Ok;
     // Without numbers, try again sooner.
     ScheduleRefresh(ok || !g_state.data.limits.empty() ? g_settings.refreshMinutes * 60000u : 60000u);
-    PublishStatus();
+    StatusPipe::Publish(g_state);
     UpdateTray();
     if (g_flyoutCreated) g_flyout.OnUsageChanged();
+}
+
+// --- Updates (GitHub releases, from VolumeOne) --------------------------------
+
+void SetUpdateStatus(UpdateState::Status status) {
+    g_update.status = status;
+    if (g_flyoutCreated) g_flyout.OnStateChanged();
+}
+
+void CheckForUpdates(bool manual) {
+    if (g_update.status == UpdateState::Checking || g_update.status == UpdateState::Installing) return;
+    g_updateManual = manual;
+    if (manual) SetUpdateStatus(UpdateState::Checking);
+    HANDLE h = CreateThread(nullptr, 0, [](void* manual) -> DWORD {
+        ULONGLONG start = GetTickCount64();
+        auto info = new Updater::ReleaseInfo;
+        if (!Updater::FetchLatest(*info)) {
+            delete info;
+            info = nullptr;
+        }
+        // A manual check keeps "Checking…" up for a moment, or it never shows.
+        ULONGLONG elapsed = GetTickCount64() - start;
+        if (manual && elapsed < 1000) Sleep(DWORD(1000 - elapsed));
+        PostMessageW(g_host, WM_APP_UPDATE_CHECKED, 0, (LPARAM)info);
+        return 0;
+    }, (void*)(INT_PTR)manual, 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
+void OnUpdateChecked(Updater::ReleaseInfo* info) {
+    LOG(L"update: check %s%s", info ? L"ok, latest " : L"failed", info ? info->version.c_str() : L"");
+    if (info && Updater::IsNewer(info->version, APP_VERSION)) {
+        g_release = *info;
+        g_update.version = info->version;
+        g_update.notes = info->notes;
+        SetUpdateStatus(UpdateState::Available);
+    } else if (g_updateManual || g_update.status == UpdateState::Checking) {
+        SetUpdateStatus(info ? UpdateState::UpToDate : UpdateState::Failed);
+    }
+    delete info;
+}
+
+void InstallUpdate() {
+    if (g_update.status != UpdateState::Available && g_update.status != UpdateState::InstallFailed) return;
+    SetUpdateStatus(UpdateState::Installing);
+    HANDLE h = CreateThread(nullptr, 0, [](void*) -> DWORD {
+        bool ok = Updater::Install(g_release);
+        PostMessageW(g_host, WM_APP_UPDATE_INSTALLED, ok, 0);
+        return 0;
+    }, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
+// --- Stream Deck plugin (streamdeck.cpp does the work) -------------------------
+
+void InstallPlugin() {
+    if (g_plugin.installing || !g_plugin.streamDeck) return;
+    g_plugin.installing = true;
+    g_plugin.failed = false;
+    if (g_flyoutCreated) g_flyout.OnStateChanged();
+    HANDLE h = CreateThread(nullptr, 0, [](void*) -> DWORD {
+        PostMessageW(g_host, WM_APP_PLUGIN_INSTALLED, StreamDeck::InstallPlugin(), 0);
+        return 0;
+    }, nullptr, 0, nullptr);
+    if (h)
+        CloseHandle(h);
+    else
+        g_plugin.installing = false;
 }
 
 // --- Flyout and menu ----------------------------------------------------------
@@ -231,7 +239,7 @@ void EnsureFlyout() {
     if (g_flyoutCreated) return;
     static bool failed = false;
     if (failed) return;
-    g_flyoutCreated = g_flyout.Create(g_inst, g_host, &g_state, &g_settings);
+    g_flyoutCreated = g_flyout.Create(g_inst, g_host, &g_state, &g_settings, &g_update, &g_plugin);
     LOG(L"flyout: create %s", g_flyoutCreated ? L"ok" : L"FAILED");
     if (!g_flyoutCreated) {
         failed = true;
@@ -239,10 +247,14 @@ void EnsureFlyout() {
     }
     g_flyout.onRefresh = [] { StartProbe(); };
     g_flyout.onTrayIconChanged = [] { UpdateTray(); };
+    g_flyout.onCheckUpdates = [] { CheckForUpdates(true); };
+    g_flyout.onInstallUpdate = [] { InstallUpdate(); };
+    g_flyout.onInstallPlugin = [] { InstallPlugin(); };
 }
 
 void ShowFlyout(bool settings) {
     EnsureFlyout();
+    if (!g_plugin.installing) StreamDeck::ReadState(g_plugin);
     if (!g_flyoutCreated) return;
     ULONGLONG now = Usage::NowTicks();
     if (!g_flyout.IsVisible() && (!g_state.data.fetchedAt || now - g_state.data.fetchedAt > kStaleOnOpen)) StartProbe();
@@ -255,6 +267,7 @@ void ToggleFlyout() {
     if (g_flyout.IsVisible())
         g_flyout.Hide();
     else {
+        if (!g_plugin.installing) StreamDeck::ReadState(g_plugin);
         ULONGLONG now = Usage::NowTicks();
         if (!g_state.data.fetchedAt || now - g_state.data.fetchedAt > kStaleOnOpen) StartProbe();
         g_flyout.Toggle();
@@ -308,8 +321,11 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
 
-        case WM_APP_SHOW_FLYOUT:
-            ShowFlyout(false);
+        case WM_APP_SHOW_FLYOUT:  // wParam: 0 main view, 1 Settings, 2 toggle (development builds)
+            if (wp == 2)
+                ToggleFlyout();
+            else
+                ShowFlyout(wp != 0);
             return 0;
 
         case WM_APP_PROBE_DONE:
@@ -320,10 +336,32 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             StartProbe();
             return 0;
 
+        case WM_APP_UPDATE_CHECKED:
+            OnUpdateChecked((Updater::ReleaseInfo*)lp);
+            return 0;
+
+        case WM_APP_UPDATE_INSTALLED:
+            LOG(L"update: install %s", wp ? L"ok, restarting" : L"failed");
+            if (wp)
+                DestroyWindow(hwnd);  // the new version is already starting
+            else
+                SetUpdateStatus(UpdateState::InstallFailed);
+            return 0;
+
+        case WM_APP_PLUGIN_INSTALLED:
+            LOG(L"stream deck plugin: install %s", wp ? L"ok" : L"FAILED");
+            g_plugin.installing = false;
+            g_plugin.failed = !wp;
+            StreamDeck::ReadState(g_plugin);
+            if (g_flyoutCreated) g_flyout.OnStateChanged();
+            return 0;
+
         case WM_TIMER:
             if (wp == kTimerRefresh) {
                 KillTimer(hwnd, kTimerRefresh);
                 StartProbe();
+            } else if (wp == kTimerUpdateCheck) {
+                CheckForUpdates(false);
             } else if (wp == kTimerTray) {
                 UpdateTray();
             } else if (wp == kTimerTrayRetry) {
@@ -364,12 +402,18 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
     g_inst = inst;
 
+#ifdef USAGEONE_DEV
     // Development aid: draw the tray icons at several sizes into a BMP and exit.
     if (const wchar_t* p = wcsstr(cmdLine, L"/icon-preview ")) {
         std::wstring path = p + 14;
         path.erase(std::remove(path.begin(), path.end(), L'"'), path.end());
         return WriteIconPreview(path.c_str()) ? 0 : 1;
     }
+#endif
+
+    // After an update the new exe is started by the old one: wait for it to
+    // exit (it holds the single-instance mutex) and delete the old file.
+    if (const wchar_t* upd = wcsstr(cmdLine, UPDATED_ARG)) Updater::FinishUpdate((DWORD)_wtoi(upd + wcslen(UPDATED_ARG)));
 
     // Single instance: a second launch opens the running one's panel.
     g_runningMutex = CreateMutexW(nullptr, FALSE, RUNNING_MUTEX_NAME);
@@ -378,16 +422,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
             DWORD pid = 0;
             GetWindowThreadProcessId(other, &pid);
             AllowSetForegroundWindow(pid);
-            PostMessageW(other, WM_APP_SHOW_FLYOUT, 0, 0);
+            WPARAM how = wcsstr(cmdLine, L"/settings") != nullptr;
+#ifdef USAGEONE_DEV
+            if (wcsstr(cmdLine, L"/toggle")) how = 2;  // tools\measure.ps1 opens and closes the panel
+#endif
+            PostMessageW(other, WM_APP_SHOW_FLYOUT, how, 0);
         }
         return 0;
     }
-    bool background = wcsstr(cmdLine, L"/background") != nullptr;
+    bool background = wcsstr(cmdLine, L"/background") != nullptr || wcsstr(cmdLine, UPDATED_ARG) != nullptr;
+#ifdef USAGEONE_DEV
+    // Development aid: /theme light|dark draws the panel in that theme (tools\screenshots.ps1).
+    if (wcsstr(cmdLine, L"/theme light")) Flyout::themeOverride = 1;
+    if (wcsstr(cmdLine, L"/theme dark")) Flyout::themeOverride = 2;
+#endif
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     Log::Init();
     InitDarkMenus();
     g_settings.Load();
+    InitStartWithWindows();
 
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = HostProc;
@@ -400,8 +454,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
 
     g_state.data.plan = Usage::ReadPlan();
     UpdateTray();
-    PublishStatus();
-    if (HANDLE h = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr)) CloseHandle(h);
+    StatusPipe::Publish(g_state);
+    StatusPipe::Start(g_host);
     // Where we are, so the Stream Deck plugin can start us when its key is pressed.
     {
         wchar_t exe[MAX_PATH];
@@ -410,7 +464,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
     }
     StartProbe();
     SetTimer(g_host, kTimerTray, 60 * 1000, nullptr);
-    if (!background) PostMessageW(g_host, WM_APP_SHOW_FLYOUT, 0, 0);
+    StreamDeck::ReadState(g_plugin);
+    CheckForUpdates(false);  // on a worker thread; then once a day
+    SetTimer(g_host, kTimerUpdateCheck, kUpdateCheckIntervalMs, nullptr);
+    if (!background) PostMessageW(g_host, WM_APP_SHOW_FLYOUT, wcsstr(cmdLine, L"/settings") != nullptr, 0);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {

@@ -1,4 +1,5 @@
 #include "flyout.h"
+#include "flyout_style.h"
 #include "log.h"
 #include "strings.h"
 
@@ -28,9 +29,6 @@ static const UINT_PTR kRegionTimer = 2;  // shrink the input region once the pan
 static const UINT_PTR kTickTimer = 3;    // countdowns, once a second while open
 static const float kShadowMargin = 32.0f;
 static const float kCornerRadius = 8.0f;
-static const wchar_t kTextFont[] = L"Segoe UI Variable Text";
-static const wchar_t kDisplayFont[] = L"Segoe UI Variable Display";
-static const wchar_t kIconFont[] = L"Segoe Fluent Icons";
 static const wchar_t kUsageUrl[] = L"https://claude.ai/settings/usage";
 
 enum : wchar_t { kGlyphRefresh = 0xE72C, kGlyphBack = 0xE72B, kGlyphOpen = 0xE8A7 };
@@ -48,10 +46,6 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
         if (!PtInRect(&rc, info->pt)) PostMessageW(g_hookOwner->Hwnd(), WM_OUTSIDE_CLICK, 0, 0);
     }
     return CallNextHookEx(g_mouseHook, code, wp, lp);
-}
-
-static D2D1_COLOR_F Rgba(UINT rgb, float a = 1.0f) {
-    return D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f, (rgb & 0xFF) / 255.0f, a);
 }
 
 // Peak hours: Monday to Friday, 13:00-19:00 UTC. Returns whether it's peak now
@@ -82,10 +76,13 @@ static bool PeakNow(ULONGLONG* change) {
 
 // ---------------------------------------------------------------------------
 
-bool Flyout::Create(HINSTANCE inst, HWND owner, const UsageState* usage, Settings* settings) {
+bool Flyout::Create(HINSTANCE inst, HWND owner, const UsageState* usage, Settings* settings, const UpdateState* update,
+                    const PluginState* plugin) {
     owner_ = owner;
     usage_ = usage;
     settings_ = settings;
+    update_ = update;
+    plugin_ = plugin;
 
     // Multi-threaded: the compositor uses the Direct2D device from its own thread.
     HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, d2d_.GetAddressOf());
@@ -363,6 +360,9 @@ void Flyout::LoadPalette() {
     RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
                  L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
     bool dark = light == 0;
+#ifdef USAGEONE_DEV
+    if (themeOverride) dark = themeOverride == 2;
+#endif
 
     // The accent palette's shades: WinUI uses Light2 on dark and Dark1 on light.
     D2D1_COLOR_F accent = Rgba(dark ? 0x99EBFF : 0x005FB8);
@@ -473,6 +473,8 @@ void Flyout::Toggle() {
 }
 
 void Flyout::Show(bool settingsView) {
+    double t0 = NowMs();
+    if (!visible_) upToDateStale_ = update_->status == UpdateState::UpToDate;
     if (visible_) {
         SetForegroundWindow(hwnd_);
         GoToView(settingsView ? View::Settings : View::Main);
@@ -501,8 +503,16 @@ void Flyout::Show(bool settingsView) {
     visible_ = true;
     ShowWindow(hwnd_, SW_SHOW);
     BOOL fg = SetForegroundWindow(hwnd_);
-    LOG(L"flyout: shown, scale %.2f, foreground %d", scale_, fg);
     UpdateWindow(hwnd_);
+#ifdef USAGEONE_DEV
+    // Development builds: how long opening took (README stats) and where the panel is (screenshots).
+    RECT pr = PanelRect();
+    LOG(L"flyout: shown in %.1f ms, scale %.2f, foreground %d, panel %ld,%ld,%ld,%ld", NowMs() - t0, scale_, fg,
+        pr.left, pr.top, pr.right - pr.left, pr.bottom - pr.top);
+#else
+    (void)t0;
+    LOG(L"flyout: shown, scale %.2f, foreground %d", scale_, fg);
+#endif
 
     // Slide in with an ease-out curve, one step per compositor frame.
     LARGE_INTEGER freq, start, now;
@@ -521,6 +531,11 @@ void Flyout::Show(bool settingsView) {
     }
     if (!visible_) return;
     SetWindowPos(hwnd_, nullptr, final.left, final.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+#ifdef USAGEONE_DEV
+    RECT settled = PanelRect();  // where it stays (tools\screenshots.ps1)
+    LOG(L"flyout: panel %ld,%ld,%ld,%ld", settled.left, settled.top, settled.right - settled.left,
+        settled.bottom - settled.top);
+#endif
     SetTimer(hwnd_, kTickTimer, 1000, nullptr);
     if (!g_mouseHook) {
         g_hookOwner = this;
@@ -542,6 +557,18 @@ void Flyout::Hide() {
     if (hexEdit_) ShowWindow(hexEdit_, SW_HIDE);
     ShowWindow(hwnd_, SW_HIDE);
     if (GetCapture() == hwnd_) ReleaseCapture();
+
+    // The next open starts on the main view. Draw it now, while hidden: the
+    // compositor shows the last committed frame until a new one is committed,
+    // and that would flash whatever was open before (e.g. Settings).
+    view_ = View::Main;
+    pending_ = false;
+    pickerOpen_ = false;
+    transition_.Set(1);
+    gear_.Set(0);
+    arrow_.Set(0);
+    hover_ = pressed_ = Hit{};
+    Render();
 }
 
 void Flyout::Reposition() {
@@ -845,6 +872,24 @@ float Flyout::LayoutMain(float y, bool draw) {
     const float x0 = 20, x1 = kWidth - 20;
     const UsageData& d = usage_->data;
 
+    // Update banner, until it's installed (Settings has what's new).
+    if (update_->status == UpdateState::Available || update_->status == UpdateState::InstallFailed ||
+        update_->status == UpdateState::Installing) {
+        bool installing = update_->status == UpdateState::Installing;
+        std::wstring text = Format(S().updateAvailable, update_->version);
+        const wchar_t* button = installing ? S().updating : S().updateNow;
+        float top = y + 12;
+        size_t hitCount = hits_.size();
+        float h = CardButtonRow(top, APP_NAME, text, button, HitKind::InstallUpdate, true, !installing, false);
+        hits_.resize(hitCount);
+        if (draw) {
+            Fill({12, top, kWidth - 12, top + h}, pal_.card, 8);
+            Stroke({12, top, kWidth - 12, top + h}, pal_.cardStroke, 8);
+        }
+        CardButtonRow(top, APP_NAME, text, button, HitKind::InstallUpdate, true, !installing, draw);
+        y = top + h - 4;
+    }
+
     // Header: title, plan, refresh button (spins while probing).
     y += 16;
     Hit refresh{HitKind::Refresh, {x1 - 32, y - 4, x1 + 4, y + 32}};
@@ -950,106 +995,125 @@ float Flyout::LayoutSettings(float y, bool draw) {
     y += 16;
     if (draw) Text(S().settings, fTitle_.Get(), {x0 + 8, y, x1, y + 24}, pal_.text);
     y += 24 + 16;
+    hexRect_ = {-1, -1, -1, -1};  // set by the bar colour block when it is fully shown
 
-    // The per-model weekly toggle is named after the rows it hides, as the
-    // panel shows them ("Show Weekly · Fable").
-    std::wstring modelWeeks;
-    for (const Limit& l : usage_->data.limits) {
-        if (!Usage::IsModelWeek(l)) continue;
-        modelWeeks += (modelWeeks.empty() ? L"" : L", ") + (modelWeeks.empty() ? LimitName(l.key) : l.key);
-    }
-    modelWeeks = modelWeeks.empty() ? std::wstring(S().showModelWeeks) : Format(S().showRow, modelWeeks);
-
-    struct Row { HitKind kind; std::wstring label; bool on; };
-    const Row rows[] = {
-        {HitKind::ToggleStartup, S().startWithWindows, startup_},
-        {HitKind::TogglePeak, S().showPeak, settings_->showPeak},
-        {HitKind::ToggleModelWeeks, modelWeeks, settings_->showModelWeeks},
-        {HitKind::ToggleStar, S().starIcon, settings_->starIcon},
-    };
-    const float rh = 52;
-    float top = y, h = rh * ARRAYSIZE(rows);
-    if (draw) {
+    auto card = [&](float top, float h) {
+        if (!draw || h <= 0) return;
         Fill({x0, top, x1, top + h}, pal_.card, 8);
         Stroke({x0, top, x1, top + h}, pal_.cardStroke, 8);
-    }
-    for (int i = 0; i < (int)ARRAYSIZE(rows); i++) {
-        float ry = top + i * rh;
-        if (i > 0 && draw) Fill({x0 + 1, ry, x1 - 1, ry + 1}, pal_.divider);
-        Hit hit{rows[i].kind, {x0, ry, x1, ry + rh}};
-        ToggleSwitch(hit, x1 - 16 - 40, ry + rh / 2, rows[i].on, draw);
-        if (draw) Text(rows[i].label, fBody_.Get(), {x0 + 16, ry, x1 - 16 - 40 - 12, ry + rh}, pal_.text);
-    }
-    y = top + h + 12;
+    };
+    auto divider = [&] {
+        if (draw) Fill({x0 + 1, y, x1 - 1, y + 1}, pal_.divider);
+    };
 
-    // Bar colour: four choices; "custom" adds a hex field, and its swatch
-    // opens a picker.
-    {
-        bool custom = settings_->barColor == Settings::BarCustom;
-        bool picker = custom && pickerOpen_;
-        const float kSvH = 110, kHueH = 14;
-        float ch = 12 + 20 + 18 + 8 + 32 + (custom ? 10 + 32 : 0) + (picker ? 10 + kSvH + 10 + kHueH : 0) + 14;
-        float cx0 = x0 + 16, cx1 = x1 - 16;
+    // A collapsible section, from VolumeOne: one card with a title row and a
+    // body that wipes open/closed. `body` draws at y and advances it; it is
+    // measured first, then drawn (shifted up while animating, so it slides out
+    // from under the header).
+    auto section = [&](int idx, const wchar_t* title, auto&& body) {
+        const float headerH = 48;
+        float v = sectionAnim_[idx].Value();
+        float headerTop = y, top = y + headerH, h = 0;
+        Hit header{HitKind::Section, {x0, headerTop, x1, top}};
+        header.index = idx;
+        if (v > 0) {
+            size_t hitCount = hits_.size();
+            bool d = draw;
+            draw = false;
+            y = top;
+            body();
+            h = y - top;
+            draw = d;
+            hits_.resize(hitCount);
+        }
+        float shown = v >= 1 ? h : std::round(h * v * scale_) / scale_;  // whole pixels while moving
+        card(headerTop, headerH + shown);
+        Button(header, draw, 7);
         if (draw) {
-            Fill({x0, y, x1, y + ch}, pal_.card, 8);
-            Stroke({x0, y, x1, y + ch}, pal_.cardStroke, 8);
-            Text(S().barColor, fBody_.Get(), {cx0, y + 12, cx1, y + 32}, pal_.text);
-            Text(S().barColorDesc, fCaption_.Get(), {cx0, y + 32, cx1, y + 50}, pal_.textSecondary);
+            Text(title, fTitle_.Get(), {x0 + 16, headerTop, x1 - 56, top}, pal_.text);
+            DrawChevron({x1 - 36, headerTop, x1 - 12, top}, pal_.textSecondary, v);
+            if (shown > 0) Fill({x0 + 1, top, x1 - 1, top + 1}, pal_.divider);
         }
-        const wchar_t* labels[] = {S().barAccent, S().barWhite, S().barGreen, S().barCustom};
-        float cy = y + 12 + 20 + 18 + 8;
-        float gap = 6, cw = (cx1 - cx0 - gap * 3) / 4;
-        for (int i = 0; i < 4; i++) {
-            float cx = cx0 + i * (cw + gap);
-            Hit chip{HitKind::BarOption, {cx, cy, cx + cw, cy + 32}};
-            chip.index = i;
-            hits_.push_back(chip);
-            if (!draw) continue;
-            bool selected = (int)settings_->barColor == i;
-            Fill(chip.rect, hover_ == chip ? pal_.subtleHover : pal_.toggleOffFill, 4);
-            Stroke(chip.rect, selected ? pal_.accent : pal_.cardStroke, 4, selected ? 2.0f : 1.0f);
-            brush_->SetColor(BarColorFor(i));
-            rt_->FillEllipse(D2D1::Ellipse({cx + 12, cy + 16}, 4.5f, 4.5f), brush_.Get());
-            Text(labels[i], fCaption_.Get(), {cx + 21, cy, cx + cw - 3, cy + 32}, pal_.text);
+        if (v > 0) {
+            size_t hitCount = hits_.size();
+            if (draw) rt_->PushAxisAlignedClip({x0, top, x1, top + shown}, D2D1_ANTIALIAS_MODE_ALIASED);
+            y = top - (h - shown);
+            body();
+            if (draw) rt_->PopAxisAlignedClip();
+            if (sectionAnim_[idx].Running()) hits_.resize(hitCount);  // not clickable while moving
         }
-        float py = cy + 32;
-        hexRect_ = {-1, -1, -1, -1};
-        if (custom) {
-            py += 10;
-            hexRect_ = {cx0, py, cx1, py + 32};
-            Hit swatch{HitKind::ColorSwatch, {cx1 - 34, py + 2, cx1 - 2, py + 30}};
-            hits_.push_back(swatch);
-            if (draw) {
-                const D2D1_RECT_F& r = hexRect_;
-                Fill(r, pal_.toggleOffFill, 4);
-                Stroke(r, pal_.cardStroke, 4);
-                Fill({r.left + 4, r.bottom - 2, r.right - 4, r.bottom - 1}, pal_.accent);
-                Text(L"#", fBody_.Get(), {r.left + 10, py, r.left + 24, py + 32}, pal_.textSecondary);
-                if (hover_ == swatch) Fill(swatch.rect, pal_.subtleHover, 4);
-                D2D1_RECT_F sw = {r.right - 26, py + 8, r.right - 10, py + 24};
-                Fill(sw, Rgba(settings_->barCustomColor), 3);
-                Stroke(sw, pickerOpen_ ? pal_.accent : pal_.cardStroke, 3, pickerOpen_ ? 2.0f : 1.0f);
-            }
-            py += 32;
-            if (picker) {
-                py += 10;
-                D2D1_RECT_F sv = {cx0, py, cx1, py + kSvH};
-                D2D1_RECT_F hue = {cx0, py + kSvH + 10, cx1, py + kSvH + 10 + kHueH};
-                hits_.push_back(Hit{HitKind::ColorSV, sv});
-                // A little extra around the hue bar, it is thin.
-                hits_.push_back(Hit{HitKind::ColorHue, {hue.left - 4, hue.top - 4, hue.right + 4, hue.bottom + 4}});
-                if (draw) DrawColorPicker(sv, hue);
-            }
+        y = top + shown + 12;
+    };
+
+    struct Row { HitKind kind; std::wstring label; bool on; };
+    auto toggleRows = [&](std::initializer_list<Row> rows) {
+        const float rh = 52;
+        bool first = true;
+        for (const Row& row : rows) {
+            if (!first) divider();
+            first = false;
+            Hit hit{row.kind, {x0, y, x1, y + rh}};
+            ToggleSwitch(hit, x1 - 16 - 40, y + rh / 2, row.on, draw);
+            if (draw) Text(row.label, fBody_.Get(), {x0 + 16, y, x1 - 16 - 40 - 12, y + rh}, pal_.text);
+            y += rh;
         }
-        y += ch + 12;
-    }
+    };
+
+    // General: starting with Windows and the tray icon.
+    section(0, S().sectionGeneral, [&] {
+        toggleRows({
+            {HitKind::ToggleStartup, S().startWithWindows, startup_},
+            {HitKind::ToggleStar, S().starIcon, settings_->starIcon},
+        });
+    });
+
+    // Panel: what it shows, and the bar colour.
+    section(1, S().sectionPanel, [&] {
+        // The per-model weekly toggle is named after the rows it hides, as the
+        // panel shows them ("Show Weekly · Fable").
+        std::wstring modelWeeks;
+        for (const Limit& l : usage_->data.limits) {
+            if (!Usage::IsModelWeek(l)) continue;
+            modelWeeks += modelWeeks.empty() ? LimitName(l.key) : L", " + l.key;
+        }
+        modelWeeks = modelWeeks.empty() ? std::wstring(S().showModelWeeks) : Format(S().showRow, modelWeeks);
+        toggleRows({
+            {HitKind::TogglePeak, S().showPeak, settings_->showPeak},
+            {HitKind::ToggleModelWeeks, modelWeeks, settings_->showModelWeeks},
+        });
+        divider();
+        y = LayoutBarColor(y, draw, !sectionAnim_[1].Running());
+    });
+
+    // Stream Deck: the plugin built into the exe. Installing copies it into
+    // Stream Deck's plugins and restarts Stream Deck.
+    section(2, S().streamDeck, [&] {
+        const PluginState& p = *plugin_;
+        std::wstring status;
+        const wchar_t* button = S().install;
+        bool enabled = p.streamDeck && !p.installing, accent = false;
+        if (!p.streamDeck) {
+            status = S().streamDeckMissing;
+        } else if (p.installing) {
+            status = S().installing;
+        } else {
+            if (p.installed.empty())
+                status = S().pluginNotInstalled, accent = true;
+            else if (p.installed != APP_VERSION)
+                status = Format(S().pluginOutdated, p.installed), button = S().updateNow, accent = true;
+            else
+                status = Format(S().pluginInstalled, p.installed), button = S().reinstall;
+            if (p.failed) status += std::wstring(L" · ") + S().installFailed;
+        }
+        y += CardButtonRow(y, S().pluginLabel, status, button, HitKind::InstallPlugin, accent, enabled, draw);
+    });
+
+    // Updates: always open, as in VolumeOne.
+    y = LayoutUpdates(y, draw);
 
     // Link to the usage page on claude.ai, in the default browser.
     Hit web{HitKind::OpenWeb, {x0, y, x1, y + 48}};
-    if (draw) {
-        Fill(web.rect, pal_.card, 8);
-        Stroke(web.rect, pal_.cardStroke, 8);
-    }
+    card(y, 48);
     Button(web, draw, 8);
     if (draw) {
         Text(S().openWeb, fBody_.Get(), {x0 + 16, y, x1 - 48, y + 48}, pal_.text);
@@ -1057,6 +1121,157 @@ float Flyout::LayoutSettings(float y, bool draw) {
     }
     y += 48 + 16;
     return y;
+}
+
+// Bar colour: four choices; "custom" adds a hex field, and its swatch opens a
+// picker (colorpicker.cpp). Drawn inside the Panel section's card.
+float Flyout::LayoutBarColor(float y, bool draw, bool settled) {
+    const float x0 = 12, x1 = kWidth - 12, cx0 = x0 + 16, cx1 = x1 - 16;
+    const float kSvH = 110, kHueH = 14;
+    bool custom = settings_->barColor == Settings::BarCustom;
+
+    y += 12;
+    if (draw) {
+        Text(S().barColor, fBody_.Get(), {cx0, y, cx1, y + 20}, pal_.text);
+        Text(S().barColorDesc, fCaption_.Get(), {cx0, y + 20, cx1, y + 38}, pal_.textSecondary);
+    }
+    y += 20 + 18 + 8;
+
+    const wchar_t* labels[] = {S().barAccent, S().barWhite, S().barGreen, S().barCustom};
+    const float gap = 6, chipW = (cx1 - cx0 - gap * 3) / 4;
+    for (int i = 0; i < 4; i++) {
+        float cx = cx0 + i * (chipW + gap);
+        Hit chip{HitKind::BarOption, {cx, y, cx + chipW, y + 32}};
+        chip.index = i;
+        hits_.push_back(chip);
+        if (!draw) continue;
+        bool selected = (int)settings_->barColor == i;
+        Fill(chip.rect, hover_ == chip ? pal_.subtleHover : pal_.toggleOffFill, 4);
+        Stroke(chip.rect, selected ? pal_.accent : pal_.cardStroke, 4, selected ? 2.0f : 1.0f);
+        brush_->SetColor(BarColorFor(i));
+        rt_->FillEllipse(D2D1::Ellipse({cx + 12, y + 16}, 4.5f, 4.5f), brush_.Get());
+        Text(labels[i], fCaption_.Get(), {cx + 21, y, cx + chipW - 3, y + 32}, pal_.text);
+    }
+    y += 32;
+
+    if (custom) {
+        y += 10;
+        D2D1_RECT_F field = {cx0, y, cx1, y + 32};
+        if (settled && draw) hexRect_ = field;  // the EDIT control goes here (UpdateHexEdit)
+        Hit swatch{HitKind::ColorSwatch, {cx1 - 34, y + 2, cx1 - 2, y + 30}};
+        hits_.push_back(swatch);
+        if (draw) {
+            Fill(field, pal_.toggleOffFill, 4);
+            Stroke(field, pal_.cardStroke, 4);
+            Fill({field.left + 4, field.bottom - 2, field.right - 4, field.bottom - 1}, pal_.accent);
+            Text(L"#", fBody_.Get(), {field.left + 10, y, field.left + 24, y + 32}, pal_.textSecondary);
+            if (hover_ == swatch) Fill(swatch.rect, pal_.subtleHover, 4);
+            D2D1_RECT_F sw = {field.right - 26, y + 8, field.right - 10, y + 24};
+            Fill(sw, Rgba(settings_->barCustomColor), 3);
+            Stroke(sw, pickerOpen_ ? pal_.accent : pal_.cardStroke, 3, pickerOpen_ ? 2.0f : 1.0f);
+        }
+        y += 32;
+        if (pickerOpen_) {
+            y += 10;
+            D2D1_RECT_F sv = {cx0, y, cx1, y + kSvH};
+            D2D1_RECT_F hue = {cx0, y + kSvH + 10, cx1, y + kSvH + 10 + kHueH};
+            hits_.push_back(Hit{HitKind::ColorSV, sv});
+            // A little extra around the hue bar, it is thin.
+            hits_.push_back(Hit{HitKind::ColorHue, {hue.left - 4, hue.top - 4, hue.right + 4, hue.bottom + 4}});
+            if (draw) DrawColorPicker(sv, hue);
+            y += kSvH + 10 + kHueH;
+        }
+    }
+    return y + 14;
+}
+
+// Updates, as in VolumeOne: the version, a check / update button, and what's
+// new when there is an update.
+float Flyout::LayoutUpdates(float y, bool draw) {
+    const float x0 = 12, x1 = kWidth - 12;
+    std::wstring status = Format(S().versionLine, APP_VERSION);
+    const wchar_t* button = S().checkUpdates;
+    HitKind kind = HitKind::CheckUpdates;
+    bool enabled = true;
+    switch (update_->status) {
+        case UpdateState::Checking: button = S().checking; enabled = false; break;
+        case UpdateState::UpToDate:
+            if (!upToDateStale_) button = S().upToDate;
+            break;
+        case UpdateState::Failed: status += std::wstring(L" · ") + S().checkFailed; break;
+        case UpdateState::Available:
+        case UpdateState::InstallFailed:
+            status += L" · " + Format(S().updateAvailable, update_->version);
+            if (update_->status == UpdateState::InstallFailed) status += std::wstring(L" · ") + S().installFailed;
+            button = S().updateNow;
+            kind = HitKind::InstallUpdate;
+            break;
+        case UpdateState::Installing:
+            status += std::wstring(L" · ") + S().updating;
+            enabled = false;
+            break;
+        default: break;
+    }
+    bool hasNotes = (update_->status == UpdateState::Available || update_->status == UpdateState::InstallFailed ||
+                     update_->status == UpdateState::Installing) && !update_->notes.empty();
+
+    // Measured first (the card goes under the row), then drawn.
+    size_t hitCount = hits_.size();
+    float rowH = CardButtonRow(y, S().updates, status, button, kind, kind == HitKind::InstallUpdate, enabled, false);
+    hits_.resize(hitCount);
+    float notesH = hasNotes ? TextHeight(update_->notes, fDesc_.Get(), x1 - x0 - 32) : 0;
+    float h = rowH + (hasNotes ? 1 + 40 + notesH + 12 : 0);
+    if (draw) {
+        Fill({x0, y, x1, y + h}, pal_.card, 8);
+        Stroke({x0, y, x1, y + h}, pal_.cardStroke, 8);
+    }
+    CardButtonRow(y, S().updates, status, button, kind, kind == HitKind::InstallUpdate, enabled, draw);
+    if (hasNotes && draw) {
+        float ny = y + rowH;
+        Fill({x0 + 1, ny, x1 - 1, ny + 1}, pal_.divider);
+        Text(Format(S().whatsNew, update_->version), fTitle_.Get(), {x0 + 16, ny + 13, x1, ny + 33}, pal_.text);
+        Text(update_->notes, fDesc_.Get(), {x0 + 16, ny + 41, x1 - 16, ny + 41 + notesH}, pal_.textSecondary);
+    }
+    return y + h + 12;
+}
+
+// The section header's arrow: pointing down when closed, up when open.
+void Flyout::DrawChevron(const D2D1_RECT_F& r, const D2D1_COLOR_F& c, float open) {
+    float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    float s = 2.5f * (1 - 2 * std::clamp(open, 0.0f, 1.0f));  // tip offset: +down, -up
+    brush_->SetColor(c);
+    rt_->DrawLine({cx - 5, cy - s}, {cx, cy + s}, brush_.Get(), 1.0f, RoundStroke());
+    rt_->DrawLine({cx, cy + s}, {cx + 5, cy - s}, brush_.Get(), 1.0f, RoundStroke());
+}
+
+// A row inside a card: a label with a status line under it and a button on
+// the right. Returns its height. Adds the button's hit when enabled.
+float Flyout::CardButtonRow(float y, const std::wstring& label, const std::wstring& status, const wchar_t* button,
+                            HitKind kind, bool accent, bool enabled, bool draw) {
+    const float x0 = 12, x1 = kWidth - 12, textX = x0 + 16;
+    float bw = TextWidth(button, fBody_.Get()) + 28;
+    float dh = TextHeight(status, fDesc_.Get(), x1 - 12 - bw - 8 - textX);
+    float h = std::max(64.0f, 12 + 20 + dh + 12);
+    Hit btn{kind, {x1 - 12 - bw, y + h / 2 - 16, x1 - 12, y + h / 2 + 16}};
+    if (enabled) hits_.push_back(btn);
+    if (draw) {
+        Text(label, fBody_.Get(), {textX, y + 12, btn.rect.left - 8, y + 32}, pal_.text);
+        Text(status, fDesc_.Get(), {textX, y + 32, btn.rect.left - 8, y + 32 + dh}, pal_.textSecondary);
+        D2D1_COLOR_F fill = accent ? pal_.accent : pal_.toggleOffFill;
+        if (!enabled)
+            fill.a *= 0.5f;
+        else if (hover_ == btn)
+            fill = accent ? D2D1::ColorF(fill.r, fill.g, fill.b, pressed_ == btn ? 0.8f : 0.9f) : pal_.subtleHover;
+        Fill(btn.rect, fill, 4);
+        if (!accent) Stroke(btn.rect, pal_.cardStroke, 4);
+        Text(button, fBody_.Get(), btn.rect, accent ? pal_.onAccent : pal_.text, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+    return h;
+}
+
+void Flyout::OnStateChanged() {
+    if (update_->status != UpdateState::UpToDate) upToDateStale_ = false;
+    if (visible_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void Flyout::LayoutFooter(float top, bool draw) {
@@ -1149,6 +1364,13 @@ void Flyout::Render() {
     EndSurfaceDraw(c->surface, dc.Get(), c->d3dContext.Get());
     c->surfaceFresh = false;
     PlacePanel(heightPx);
+#ifdef USAGEONE_DEV
+    if (visible_ && heightPx != loggedH_) {  // tools\screenshots.ps1 reads the latest
+        loggedH_ = heightPx;
+        RECT pr = PanelRect();
+        LOG(L"flyout: panel %ld,%ld,%ld,%ld", pr.left, pr.top, pr.right - pr.left, pr.bottom - pr.top);
+    }
+#endif
 }
 
 D2D1_POINT_2F Flyout::ToPanel(int x, int y) const { return {(x - panelX_) / scale_, (y - panelY_) / scale_}; }
@@ -1201,6 +1423,24 @@ void Flyout::Activate(const Hit& h) {
             settings_->starIcon = !settings_->starIcon;
             settings_->Save();
             if (onTrayIconChanged) onTrayIconChanged();
+            break;
+        case HitKind::Section:
+            if (h.index < 0 || h.index >= kSections) break;
+            for (const Anim& a : sectionAnim_)
+                if (a.Running()) return;  // one at a time: clicks meanwhile don't queue up
+            sectionOpen_[h.index] = !sectionOpen_[h.index];
+            sectionAnim_[h.index].Go(sectionOpen_[h.index] ? 1.0f : 0.0f, 250);
+            StartFramePump();
+            break;
+        case HitKind::CheckUpdates:
+            upToDateStale_ = false;
+            if (onCheckUpdates) onCheckUpdates();
+            break;
+        case HitKind::InstallUpdate:
+            if (onInstallUpdate) onInstallUpdate();
+            break;
+        case HitKind::InstallPlugin:
+            if (onInstallPlugin) onInstallPlugin();
             break;
         case HitKind::OpenWeb:
             Hide();
@@ -1280,6 +1520,8 @@ void Flyout::SwitchView(View v) {
 bool Flyout::Animating() const {
     if (pending_ || gear_.Running() || arrow_.Running() || transition_.Running()) return true;
     if ((usage_->probing || spinning_) && view_ == View::Main) return true;
+    for (const Anim& a : sectionAnim_)
+        if (a.Running()) return true;
     for (const Anim& a : bars_)
         if (a.Running()) return true;
     return false;
@@ -1425,180 +1667,4 @@ LRESULT Flyout::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
     }
     return DefWindowProcW(hwnd_, msg, wp, lp);
-}
-
-// ---------------------------------------------------------------------------
-// Bar colour "custom": hex field and picker, from VolumeOne.
-
-// The hex field is a real EDIT control laid over the field the settings view
-// draws. Called after each paint.
-void Flyout::UpdateHexEdit() {
-    bool show = visible_ && view_ == View::Settings && !transition_.Running() && !pending_ && hexRect_.top >= 0 &&
-                hexRect_.bottom <= contentBottom_;
-    if (!show) {
-        if (hexEdit_ && IsWindowVisible(hexEdit_)) ShowWindow(hexEdit_, SW_HIDE);
-        return;
-    }
-    int fontPx = (int)std::lround(14 * scale_);
-    static int lastFontPx = 0;
-    if (!hexFont_ || lastFontPx != fontPx) {
-        if (hexFont_) DeleteObject(hexFont_);
-        hexFont_ = CreateFontW(-fontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                               CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, kTextFont);
-        if (hexEdit_) SendMessageW(hexEdit_, WM_SETFONT, (WPARAM)hexFont_, TRUE);
-        lastFontPx = fontPx;
-    }
-    if (!hexEdit_) {
-        // Layered: the panel has no redirection bitmap for a plain child to
-        // draw into; a layered child gets its own surface.
-        hexEdit_ = CreateWindowExW(WS_EX_LAYERED, L"EDIT", nullptr, WS_CHILD | ES_AUTOHSCROLL | ES_UPPERCASE, 0, 0, 10,
-                                   10, hwnd_, (HMENU)1, GetModuleHandleW(nullptr), nullptr);
-        if (!hexEdit_) return;
-        SetLayeredWindowAttributes(hexEdit_, 0, 255, LWA_ALPHA);
-        SendMessageW(hexEdit_, EM_LIMITTEXT, 6, 0);
-        SendMessageW(hexEdit_, WM_SETFONT, (WPARAM)hexFont_, FALSE);
-        SetWindowLongPtrW(hexEdit_, GWLP_USERDATA, SetWindowLongPtrW(hexEdit_, GWLP_WNDPROC, (LONG_PTR)HexEditProc));
-    }
-    if (!IsWindowVisible(hexEdit_)) {
-        wchar_t text[8];
-        swprintf_s(text, L"%06X", settings_->barCustomColor & 0xFFFFFF);
-        pickerSyncing_ = true;
-        SetWindowTextW(hexEdit_, text);
-        pickerSyncing_ = false;
-    }
-    // Inside the drawn field, between the "#" and the swatch.
-    const D2D1_RECT_F& r = hexRect_;
-    int x = panelX_ + (int)std::lround((r.left + 24) * scale_);
-    int h = (int)std::lround(fontPx * 1.4f);
-    int y = panelY_ + (int)std::lround(((r.top + r.bottom) / 2) * scale_) - h / 2;
-    int w = panelX_ + (int)std::lround((r.right - 40) * scale_) - x;
-    SetWindowPos(hexEdit_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
-
-// Only hex digits get in. A pasted colour drops its "#" (or "0x") and, when
-// it is a whole colour, replaces the field.
-LRESULT CALLBACK Flyout::HexEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    auto base = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (msg == WM_CHAR && wp >= 0x20 && !iswxdigit((wint_t)wp)) return 0;
-    if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {  // Esc works as elsewhere in the panel
-        SendMessageW(GetParent(hwnd), WM_KEYDOWN, wp, lp);
-        return 0;
-    }
-    if (msg == WM_PASTE) {
-        std::wstring text;
-        if (OpenClipboard(hwnd)) {
-            if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
-                if (auto p = (const wchar_t*)GlobalLock(data)) {
-                    text = p;
-                    GlobalUnlock(data);
-                }
-            }
-            CloseClipboard();
-        }
-        size_t i = text.find_first_not_of(L" \t\r\n");
-        if (i == std::wstring::npos) return 0;
-        if (text[i] == L'#')
-            i++;
-        else if (text.compare(i, 2, L"0x") == 0 || text.compare(i, 2, L"0X") == 0)
-            i += 2;
-        std::wstring hex;
-        for (; i < text.size() && iswxdigit(text[i]) && hex.size() < 6; i++) hex += text[i];
-        if (hex.empty()) return 0;
-        if (hex.size() == 6) SendMessageW(hwnd, EM_SETSEL, 0, -1);
-        SendMessageW(hwnd, EM_REPLACESEL, TRUE, (LPARAM)hex.c_str());
-        return 0;
-    }
-    return CallWindowProcW(base, hwnd, msg, wp, lp);
-}
-
-static DWORD HsvToRgb(float h, float s, float v) {
-    float c = v * s, hp = std::fmod(h, 360.0f) / 60.0f, x = c * (1 - std::fabs(std::fmod(hp, 2.0f) - 1));
-    float r = 0, g = 0, b = 0;
-    if (hp < 1) r = c, g = x;
-    else if (hp < 2) r = x, g = c;
-    else if (hp < 3) g = c, b = x;
-    else if (hp < 4) g = x, b = c;
-    else if (hp < 5) r = x, b = c;
-    else r = c, b = x;
-    float m = v - c;
-    auto byte = [&](float f) { return (DWORD)std::lround(std::clamp(f + m, 0.0f, 1.0f) * 255); };
-    return (byte(r) << 16) | (byte(g) << 8) | byte(b);
-}
-
-// The picker's position from the colour. Hue (and saturation, for black) stay
-// where they were when the colour does not define them.
-void Flyout::SyncPickerFromColor() {
-    DWORD c = settings_->barCustomColor;
-    float r = ((c >> 16) & 0xFF) / 255.0f, g = ((c >> 8) & 0xFF) / 255.0f, b = (c & 0xFF) / 255.0f;
-    float mx = std::max({r, g, b}), mn = std::min({r, g, b}), d = mx - mn;
-    pickerV_ = mx;
-    if (mx > 0) pickerS_ = d / mx;
-    if (d > 0) {
-        float h = mx == r ? std::fmod((g - b) / d, 6.0f) : mx == g ? (b - r) / d + 2 : (r - g) / d + 4;
-        pickerH_ = h * 60 < 0 ? h * 60 + 360 : h * 60;
-    }
-}
-
-// Dragging in the square or along the hue bar. Saved when the drag ends.
-void Flyout::SetPickerValue(const Hit& h, float x, float y) {
-    const D2D1_RECT_F& r = h.rect;
-    if (h.kind == HitKind::ColorSV) {
-        pickerS_ = std::clamp((x - r.left) / (r.right - r.left), 0.0f, 1.0f);
-        pickerV_ = 1 - std::clamp((y - r.top) / (r.bottom - r.top), 0.0f, 1.0f);
-    } else {
-        // The hit is 4 DIPs wider than the bar on each side.
-        pickerH_ = std::clamp((x - r.left - 4) / (r.right - r.left - 8), 0.0f, 1.0f) * 359.9f;
-    }
-    DWORD c = HsvToRgb(pickerH_, pickerS_, pickerV_);
-    settings_->barCustomColor = c;
-    if (hexEdit_) {
-        wchar_t text[8];
-        swprintf_s(text, L"%06X", c);
-        pickerSyncing_ = true;
-        SetWindowTextW(hexEdit_, text);
-        pickerSyncing_ = false;
-    }
-    InvalidateRect(hwnd_, nullptr, FALSE);
-}
-
-void Flyout::DrawColorPicker(const D2D1_RECT_F& sv, const D2D1_RECT_F& hue) {
-    auto gradient = [&](const D2D1_GRADIENT_STOP* stops, UINT n, D2D1_POINT_2F a, D2D1_POINT_2F b) {
-        ComPtr<ID2D1GradientStopCollection> coll;
-        ComPtr<ID2D1LinearGradientBrush> brush;
-        if (SUCCEEDED(rt_->CreateGradientStopCollection(stops, n, &coll)))
-            rt_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(a, b), coll.Get(), &brush);
-        return brush;
-    };
-
-    // Square: the hue, white towards the left, black towards the bottom.
-    D2D1_ROUNDED_RECT svr = {sv, 4, 4};
-    brush_->SetColor(Rgba(HsvToRgb(pickerH_, 1, 1)));
-    rt_->FillRoundedRectangle(svr, brush_.Get());
-    D2D1_GRADIENT_STOP white[] = {{0, D2D1::ColorF(1, 1, 1, 1)}, {1, D2D1::ColorF(1, 1, 1, 0)}};
-    if (auto b = gradient(white, 2, {sv.left, sv.top}, {sv.right, sv.top})) rt_->FillRoundedRectangle(svr, b.Get());
-    D2D1_GRADIENT_STOP black[] = {{0, D2D1::ColorF(0, 0, 0, 0)}, {1, D2D1::ColorF(0, 0, 0, 1)}};
-    if (auto b = gradient(black, 2, {sv.left, sv.top}, {sv.left, sv.bottom})) rt_->FillRoundedRectangle(svr, b.Get());
-    Stroke(sv, pal_.cardStroke, 4);
-
-    // Hue bar: red, yellow, green, cyan, blue, magenta, red.
-    D2D1_GRADIENT_STOP hues[7];
-    for (int i = 0; i < 7; i++) hues[i] = {i / 6.0f, Rgba(HsvToRgb(i * 60.0f, 1, 1))};
-    float rad = (hue.bottom - hue.top) / 2;
-    if (auto b = gradient(hues, 7, {hue.left, hue.top}, {hue.right, hue.top}))
-        rt_->FillRoundedRectangle({hue, rad, rad}, b.Get());
-    Stroke(hue, pal_.cardStroke, rad);
-
-    // Handles: white rings with a thin dark edge, filled with their colour.
-    auto handle = [&](D2D1_POINT_2F p, float r, DWORD color) {
-        brush_->SetColor(Rgba(color));
-        rt_->FillEllipse(D2D1::Ellipse(p, r, r), brush_.Get());
-        brush_->SetColor(Rgba(0xFFFFFF));
-        rt_->DrawEllipse(D2D1::Ellipse(p, r, r), brush_.Get(), 2.0f);
-        brush_->SetColor(Rgba(0x000000, 0.35f));
-        rt_->DrawEllipse(D2D1::Ellipse(p, r + 1.5f, r + 1.5f), brush_.Get(), 1.0f);
-    };
-    handle({sv.left + pickerS_ * (sv.right - sv.left), sv.top + (1 - pickerV_) * (sv.bottom - sv.top)}, 6,
-           HsvToRgb(pickerH_, pickerS_, pickerV_));
-    handle({hue.left + pickerH_ / 360.0f * (hue.right - hue.left), (hue.top + hue.bottom) / 2}, rad - 1,
-           HsvToRgb(pickerH_, 1, 1));
 }
